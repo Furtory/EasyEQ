@@ -1,0 +1,37 @@
+All functions with WinActive
+	$_SwitchKnobsGUI -> check as array
+
+Function SwitchKnobsInitialize
+	$_SwitchKnobsGUIPosition[] -> add extra dimension for gui handle
+	$_SwitchKnobsGUI -> convert to array
+
+Function _SwitchKnobCreateGraphicObject
+	$_SwitchKnobsGraphic -> convert to array
+
+Function SwitchKnobsRedraw
+	$_SwitchKnobsGUI -> check as array
+	$_SwitchKnobsGUIPosition[] -> search for current gui
+	$_SwitchKnobsGraphic[] -> search for current graphic
+
+Functions SwitchKnobsScan, SwitchKnobsReset
+	$_SwitchKnobsGUI -> get current cursor info
+
+Function _SwitchKnobDraw
+	$DCHandle -> search for current gui
+
+Function SwitchKnobGetGUI
+	$_SwitchKnobsGUI -> return what? first gui? all gui's?
+
+Function SwitchKnobsDestroy
+	$_SwitchKnobsGraphic -> destroy all of array
+
+Function _SwitchKnobDraw
+	$_SwitchKnobsGraphic -> determine knob belonging to which gui -> this is a major issue -> each knob needs a gui handle
+
+Function SwitchKnobsDraw
+	draw only given gui no
+
+All above changes also apply for rotary knob functions and
+
+Function RotaryKnobDial
+	$_RotaryKnobsGUI -> get current cursor info

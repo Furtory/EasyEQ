@@ -1,0 +1,402 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace PeaceWpf.Core.Model;
+
+/// <summary>
+/// WPF 侧自己的界面状态，存成 JSON，不复用 Peace 的 ini。
+///
+/// 后端只有一套段槽位，两层 EQ 合并后写进去之后就分不开了，
+/// 所以两层曲线、低音开关、左右平衡都必须在这里各存一份。
+/// 音频参数仍然以后端为准：后端读回来的永远当作主层的最新状态。
+/// </summary>
+public sealed class UiState
+{
+    public const string FileName = "ui-state.json";
+
+    [JsonPropertyName("theme")]
+    public string Theme { get; set; } = "Dark";
+
+    [JsonPropertyName("windowWidth")]
+    public double WindowWidth { get; set; } = 1180;
+
+    [JsonPropertyName("windowHeight")]
+    public double WindowHeight { get; set; } = 720;
+
+    [JsonPropertyName("showGrid")]
+    public bool ShowGrid { get; set; } = true;
+
+    [JsonPropertyName("gainRangeDb")]
+    public double GainRangeDb { get; set; } = 15;
+
+    /// <summary>主层（“左右”曲线）。启动时先用它把界面画出来，连上后端后再以后端为准。</summary>
+    [JsonPropertyName("mainPoints")]
+    public List<UiPoint> MainPoints { get; set; } = new();
+
+    /// <summary>低音层。后端读不回来，只能靠这里保存。</summary>
+    [JsonPropertyName("bassPoints")]
+    public List<UiPoint> BassPoints { get; set; } = new();
+
+    /// <summary>低音层是否参与合并。默认开。</summary>
+    [JsonPropertyName("bassLayerEnabled")]
+    public bool BassLayerEnabled { get; set; } = true;
+
+    /// <summary>左右平衡，-1（全左）到 1（全右），0 是居中。</summary>
+    [JsonPropertyName("balance")]
+    public double Balance { get; set; }
+
+    /// <summary>曲线底部的实时频谱开关。抓不到音频时不报错，只是不显示。</summary>
+    [JsonPropertyName("spectrumEnabled")]
+    public bool SpectrumEnabled { get; set; } = true;
+
+    /// <summary>无延迟防爆音开关：挂一个 ClipOnly3 在链路末尾，只在快破音时削峰。</summary>
+    [JsonPropertyName("peakGuardEnabled")]
+    public bool PeakGuardEnabled { get; set; }
+
+    /// <summary>主层当前对应的 Peace 预设文件名。</summary>
+    [JsonPropertyName("mainConfig")]
+    public string MainConfig { get; set; } = "EsportsMain.peace";
+
+    /// <summary>低音层当前对应的 Peace 预设文件名。</summary>
+    [JsonPropertyName("bassConfig")]
+    public string BassConfig { get; set; } = "EsportsBass.peace";
+
+    /// <summary>
+    /// 「左右」每个预设各自记住的预增益（dB），键是 .peace 文件名。
+    ///
+    /// 增益只属于左右这条曲线：低音层没有自己的增益，切到低音也不会动它。
+    /// 不写进 .peace，是因为 Peace 的预设格式里没有这一项，硬塞一个它不认识的键
+    /// 换来的只是文件更难解释；这个值只在软件自己的配置里跟着预设走。
+    /// </summary>
+    [JsonPropertyName("mainPreAmps")]
+    public Dictionary<string, double> MainPreAmps { get; set; } = new();
+
+    /// <summary>
+    /// 「左右」每个预设各自记住的一套风味，键是 .peace 文件名。
+    ///
+    /// 风味是八条固定滤波器，叠加在左右曲线上，只进 peace.txt、不进 .peace：
+    /// Peace 的预设格式没有这一项，硬塞只会让文件更难解释。
+    /// 所以它和预增益一样，只在软件自己的配置里跟着预设走。
+    /// </summary>
+    [JsonPropertyName("mainFlavors")]
+    public Dictionary<string, List<UiFlavor>> MainFlavors { get; set; } = new();
+
+    /// <summary>
+    /// 下拉栏里预设的顺序，用户拖出来的。文件是按名字排的，这里记的是人排的；
+    /// 不在这张表里的名字按文件名的本地化顺序补在后面。
+    /// </summary>
+    [JsonPropertyName("presetOrder")]
+    public List<string> PresetOrder { get; set; } = new();
+
+    /// <summary>
+    /// 用户手动选的 EqualizerAPO config 目录。null 表示按默认位置找。
+    /// 机器相关的路径，导入备份时不跟着走。
+    /// </summary>
+    [JsonPropertyName("configDirectoryOverride")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ConfigDirectoryOverride { get; set; }
+
+    /// <summary>开机自启时是否把主界面显示出来；false 就是最小化启动。</summary>
+    [JsonPropertyName("showWindowOnStart")]
+    public bool ShowWindowOnStart { get; set; } = true;
+
+    /// <summary>旧版本只有一条曲线，读进来之后升级成主层；写回时不再输出这个字段。</summary>
+    [JsonPropertyName("points")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<UiPoint>? LegacyPoints { get; set; }
+
+    /// <summary>所在目录：%LOCALAPPDATA%\PeaceWpf。</summary>
+    public static string Directory =>
+        System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PeaceWpf");
+
+    public static string FilePath => System.IO.Path.Combine(Directory, FileName);
+
+    /// <summary>
+    /// 把另一份状态整体抄进来（导入备份用）。字段级拷贝，换的是内容不是对象，
+    /// 因为 MainViewModel 里拿着这个实例的引用，换对象会把正在跑的东西甩掉。
+    /// </summary>
+    public void CopyFrom(UiState other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+
+        Theme = other.Theme;
+        WindowWidth = other.WindowWidth;
+        WindowHeight = other.WindowHeight;
+        ShowGrid = other.ShowGrid;
+        GainRangeDb = other.GainRangeDb;
+        MainPoints = other.MainPoints?.ToList() ?? new List<UiPoint>();
+        BassPoints = other.BassPoints?.ToList() ?? new List<UiPoint>();
+        BassLayerEnabled = other.BassLayerEnabled;
+        Balance = other.Balance;
+        SpectrumEnabled = other.SpectrumEnabled;
+        PeakGuardEnabled = other.PeakGuardEnabled;
+        MainConfig = other.MainConfig;
+        BassConfig = other.BassConfig;
+        MainPreAmps = other.MainPreAmps is null
+            ? new Dictionary<string, double>()
+            : new Dictionary<string, double>(other.MainPreAmps);
+        MainFlavors = other.MainFlavors is null
+            ? new Dictionary<string, List<UiFlavor>>()
+            : other.MainFlavors.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value?.Select(item => item.Clone()).ToList() ?? new List<UiFlavor>());
+        PresetOrder = other.PresetOrder?.ToList() ?? new List<string>();
+        LegacyPoints = null;
+    }
+
+    /// <summary>取某个左右预设记住的预增益；这个预设还没记过就返回 false。</summary>
+    public bool TryGetMainPreAmp(string preset, out double preAmpDb)
+    {
+        preAmpDb = 0;
+        if (MainPreAmps is null || string.IsNullOrWhiteSpace(preset))
+        {
+            return false;
+        }
+
+        if (MainPreAmps.TryGetValue(preset, out preAmpDb))
+        {
+            return true;
+        }
+
+        // 文件名在 Windows 上不分大小写，词典却分；找不到精确键时补一遍忽略大小写的查找。
+        foreach (var pair in MainPreAmps)
+        {
+            if (string.Equals(pair.Key, preset, StringComparison.OrdinalIgnoreCase))
+            {
+                preAmpDb = pair.Value;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>记下某个左右预设的预增益；同一个预设不区分大小写只留一份。</summary>
+    public void SetMainPreAmp(string preset, double preAmpDb)
+    {
+        if (string.IsNullOrWhiteSpace(preset))
+        {
+            return;
+        }
+
+        MainPreAmps ??= new Dictionary<string, double>();
+        foreach (var key in MainPreAmps.Keys
+                     .Where(key => !string.Equals(key, preset, StringComparison.Ordinal)
+                         && string.Equals(key, preset, StringComparison.OrdinalIgnoreCase))
+                     .ToList())
+        {
+            MainPreAmps.Remove(key);
+        }
+
+        MainPreAmps[preset] = preAmpDb;
+    }
+
+    /// <summary>
+    /// 取某个左右预设记住的风味。没记过、或者条目读不出来时返回 false，
+    /// 由调用方决定用默认一套（八条全平）——不要在这里悄悄造一份带增益的。
+    /// </summary>
+    public bool TryGetMainFlavors(string preset, out FlavorSet flavors)
+    {
+        flavors = FlavorSet.CreateDefault();
+        if (MainFlavors is null || string.IsNullOrWhiteSpace(preset))
+        {
+            return false;
+        }
+
+        List<UiFlavor>? stored = null;
+        if (MainFlavors.TryGetValue(preset, out var exact))
+        {
+            stored = exact;
+        }
+        else
+        {
+            // 文件名在 Windows 上不分大小写，词典却分；补一遍忽略大小写的查找。
+            foreach (var pair in MainFlavors)
+            {
+                if (string.Equals(pair.Key, preset, StringComparison.OrdinalIgnoreCase))
+                {
+                    stored = pair.Value;
+                    break;
+                }
+            }
+        }
+
+        if (stored is null)
+        {
+            return false;
+        }
+
+        flavors = FlavorSet.FromBands(stored
+            .Where(item => item is not null)
+            .Select(item => new FlavorBand(item.Key, item.FrequencyHz, item.GainDb, item.Quality, item.FilterType)));
+        return true;
+    }
+
+    /// <summary>记下某个左右预设的风味；同一个预设不区分大小写只留一份。</summary>
+    public void SetMainFlavors(string preset, FlavorSet flavors)
+    {
+        ArgumentNullException.ThrowIfNull(flavors);
+        if (string.IsNullOrWhiteSpace(preset))
+        {
+            return;
+        }
+
+        MainFlavors ??= new Dictionary<string, List<UiFlavor>>();
+        foreach (var key in MainFlavors.Keys
+                     .Where(key => !string.Equals(key, preset, StringComparison.Ordinal)
+                         && string.Equals(key, preset, StringComparison.OrdinalIgnoreCase))
+                     .ToList())
+        {
+            MainFlavors.Remove(key);
+        }
+
+        MainFlavors[preset] = flavors.Bands
+            .Select(band => new UiFlavor
+            {
+                Key = band.Key,
+                FrequencyHz = band.FrequencyHz,
+                GainDb = band.GainDb,
+                Quality = band.Quality,
+                FilterType = band.FilterType,
+            })
+            .ToList();
+    }
+
+    /// <summary>把缓存的两层读出来；一份都没有时返回 null。</summary>
+    public EqLayerSet? ToLayerSet()
+    {
+        var mainSource = MainPoints is { Count: > 0 } ? MainPoints : LegacyPoints;
+        var main = mainSource is { Count: > 0 } ? ToList(mainSource) : null;
+        var bass = BassPoints is { Count: > 0 } ? ToList(BassPoints) : null;
+
+        if (main is null && bass is null)
+        {
+            return null;
+        }
+
+        return new EqLayerSet(main ?? EqPointList.CreateDefault(), bass ?? EqPointList.CreateDefault());
+    }
+
+    /// <summary>把两层写进缓存。只存四个数值，Id 是会话内的东西，不落盘。</summary>
+    public void SetLayers(EqLayerSet layers)
+    {
+        ArgumentNullException.ThrowIfNull(layers);
+        MainPoints = ToUiPoints(layers.Main);
+        BassPoints = ToUiPoints(layers.Bass);
+        LegacyPoints = null;
+    }
+
+    private static EqPointList ToList(IEnumerable<UiPoint> points) =>
+        EqPointList.FromPoints(points.Select(point => new EqPoint(
+            0,
+            point.FrequencyHz,
+            point.GainDb,
+            point.Quality,
+            point.Endpoint,
+            EqLimits.ClampFilter(point.FilterType))));
+
+    private static List<UiPoint> ToUiPoints(EqPointList list) =>
+        list.Points.Select(point => new UiPoint
+        {
+            FrequencyHz = point.FrequencyHz,
+            GainDb = point.GainDb,
+            Quality = point.Quality,
+            Endpoint = point.IsEndpoint,
+            FilterType = point.FilterType,
+        }).ToList();
+}
+
+/// <summary>落盘用的点。故意不和 EqPoint 共用一个类型：文件格式要能单独演进。</summary>
+public sealed class UiPoint
+{
+    [JsonPropertyName("frequencyHz")]
+    public double FrequencyHz { get; set; }
+
+    [JsonPropertyName("gainDb")]
+    public double GainDb { get; set; }
+
+    [JsonPropertyName("quality")]
+    public double Quality { get; set; } = 1.41;
+
+    [JsonPropertyName("endpoint")]
+    public bool Endpoint { get; set; }
+
+    /// <summary>滤波器类型序号；0 是 PK。旧版本没有这个字段，读进来就是 0。</summary>
+    [JsonPropertyName("filterType")]
+    public int FilterType { get; set; }
+}
+
+/// <summary>落盘用的风味条目。和 <see cref="FlavorBand"/> 一样故意分开：文件格式要能单独演进。</summary>
+public sealed class UiFlavor
+{
+    /// <summary>对应 <see cref="ToneBands"/> 里的 Key；靠它认人，不靠下标。</summary>
+    [JsonPropertyName("key")]
+    public string Key { get; set; } = string.Empty;
+
+    [JsonPropertyName("frequencyHz")]
+    public double FrequencyHz { get; set; }
+
+    [JsonPropertyName("gainDb")]
+    public double GainDb { get; set; }
+
+    [JsonPropertyName("quality")]
+    public double Quality { get; set; } = 1.41;
+
+    /// <summary>滤波器类型序号；0 是 PK。</summary>
+    [JsonPropertyName("filterType")]
+    public int FilterType { get; set; }
+
+    /// <summary>导入备份时深拷用。</summary>
+    public UiFlavor Clone() => new()
+    {
+        Key = Key,
+        FrequencyHz = FrequencyHz,
+        GainDb = GainDb,
+        Quality = Quality,
+        FilterType = FilterType,
+    };
+}
+
+/// <summary>界面状态的读写，出错时静默回退到默认值。</summary>
+public static class UiStateStore
+{
+    private static readonly JsonSerializerOptions Options = new()
+    {
+        WriteIndented = true,
+    };
+
+    public static UiState Load()
+    {
+        try
+        {
+            if (!File.Exists(UiState.FilePath))
+            {
+                return new UiState();
+            }
+
+            var json = File.ReadAllText(UiState.FilePath);
+            return JsonSerializer.Deserialize<UiState>(json) ?? new UiState();
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return new UiState();
+        }
+    }
+
+    public static void Save(UiState state)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(UiState.Directory);
+            var json = JsonSerializer.Serialize(state, Options);
+            File.WriteAllText(UiState.FilePath, json);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 界面状态存不下来不该影响正在调音。
+            System.Diagnostics.Debug.WriteLine($"UiState 保存失败：{ex.Message}");
+        }
+    }
+}

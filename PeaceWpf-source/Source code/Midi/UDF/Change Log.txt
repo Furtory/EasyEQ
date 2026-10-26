@@ -1,0 +1,22 @@
+MidiUDF v1.2
+Last Modified: 7th July 2022
+
+V1.2 - 7th July 2022
+-------------------------------------------------------------------------------------------------------
+Script breaking:
+- None.
+-------------------------------------------------------------------------------------------------------
+Non-script breaking:
+- Added "address" and "size" un/packing functions to complement the existing SysEx data transfer functions.
+- Added functions for retrieving names from midi device handles
+- Fixed scite integration script stripping out _midiAPI_* keywords/calltips instead of old _midi_* ones.
+_______________________________________________________________________________________________________
+
+V1.1 - 5th July 2022
+-------------------------------------------------------------------------------------------------------
+Script breaking:
+- None.
+-------------------------------------------------------------------------------------------------------
+Non-script breaking:
+- Fixed documentation and calltips for some functions
+- Fixed _midi_SendPitchBend example

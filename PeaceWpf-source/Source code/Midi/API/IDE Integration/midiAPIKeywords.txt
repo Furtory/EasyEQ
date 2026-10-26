@@ -1,0 +1,13 @@
+au3.keywords.user.udfs=_midiapi_connect _midiapi_disconnect \
+	_midiapi_inaddbuffer _midiapi_inclose _midiapi_ingetdevcaps \
+	_midiapi_ingeterrortext _midiapi_ingetnumdevs _midiapi_inopen \
+	_midiapi_inprepareheader _midiapi_inreset _midiapi_instart \
+	_midiapi_instop _midiapi_inunprepareheader _midiapi_outcachedrumpatches \
+	_midiapi_outcachepatches _midiapi_outclose _midiapi_outgetdevcaps \
+	_midiapi_outgeterrortext _midiapi_outgetnumdevs _midiapi_outgetvolume \
+	_midiapi_outlongmsg _midiapi_outopen _midiapi_outprepareheader \
+	_midiapi_outreset _midiapi_outsetvolume _midiapi_outshortmsg \
+	_midiapi_outunprepareheader _midiapi_shutdown _midiapi_startup \
+	_midiapi_streamclose _midiapi_streamopen _midiapi_streamout \
+	_midiapi_streampause _midiapi_streamposition _midiapi_streamproperty \
+	_midiapi_streamrestart _midiapi_streamstop 

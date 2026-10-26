@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PeaceWpf.Core/PeaceWpf.Core.csproj" />
+    <Project Path="src/PeaceWpf/PeaceWpf.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PeaceWpf.Core.SelfTest/PeaceWpf.Core.SelfTest.csproj" />
+  </Folder>
+</Solution>

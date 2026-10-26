@@ -1,0 +1,15 @@
+<Project>
+  <!-- 全解决方案共享的编译设置。 -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <Version>0.1.0</Version>
+    <Product>电竞调音台</Product>
+    <AssemblyTitle>电竞调音台</AssemblyTitle>
+    <Company>PeaceWpf</Company>
+    <Copyright>Peace WPF front-end. Peace back-end by Peter Verbeek.</Copyright>
+    <SatelliteResourceLanguages>en;zh-Hans</SatelliteResourceLanguages>
+  </PropertyGroup>
+</Project>

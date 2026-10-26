@@ -1,0 +1,191 @@
+<ui:FluentWindow x:Class="PeaceWpf.AutoCalibrateWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 Title="自动EQ · 扫频校准"
+                 Width="900"
+                 Height="660"
+                 WindowStartupLocation="CenterOwner"
+                 ResizeMode="NoResize">
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- 目标 + 麦克风 + 次数 + 开始 -->
+        <Grid Grid.Row="0" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel>
+                <TextBlock x:Name="TargetText"
+                           FontSize="15"
+                           FontWeight="SemiBold" />
+                <TextBlock x:Name="TargetHint"
+                           FontSize="12"
+                           Opacity="0.65"
+                           TextWrapping="Wrap"
+                           Margin="0,3,0,0" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Margin="16,0,12,0" VerticalAlignment="Center">
+                <TextBlock Text="麦克风" FontSize="11" Opacity="0.6" />
+                <ComboBox x:Name="DeviceBox"
+                          Width="230"
+                          Margin="0,3,0,0"
+                          FontSize="12"
+                          AutomationProperties.AutomationId="CalibrateDeviceBox"
+                          ToolTip="用哪个麦克风听回扫频声；没有专业测量麦时，耳机自带的也能用，只是高低频会不太准"
+                          DisplayMemberPath="Name" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Margin="0,0,12,0" VerticalAlignment="Center">
+                <TextBlock Text="速度" FontSize="11" Opacity="0.6" />
+                <ComboBox x:Name="SpeedBox"
+                          Width="104"
+                          Margin="0,3,0,0"
+                          FontSize="12"
+                          AutomationProperties.AutomationId="CalibrateSpeedBox"
+                          SelectionChanged="OnSpeedChanged"
+                          ToolTip="快速：扫 1 遍，约 30 秒；标准：扫 2 遍，约 2 分钟；更准：扫 3 遍，约 5 分钟。手上有结果时换档会先问一句，确认后清空" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="3" VerticalAlignment="Center">
+                <Button x:Name="StartButton"
+                        Content="开始测量"
+                        AutomationProperties.AutomationId="CalibrateStartButton"
+                        Click="OnMeasureClick"
+                        Padding="18,8"
+                        MinWidth="112"
+                        FontSize="13"
+                        ToolTip="测完会变成「继续测量」：可以先套用结果，再测一遍看看还差多少。测量中再点一下是停止。" />
+                <Button x:Name="PreviewButton"
+                        Content="试听扫频"
+                        AutomationProperties.AutomationId="CalibratePreviewButton"
+                        Click="OnPreviewSweep"
+                        Padding="18,6"
+                        MinWidth="112"
+                        Margin="0,6,0,0"
+                        FontSize="12"
+                        ToolTip="放一遍 5 秒的扫频声（20 Hz 慢慢升到 20 kHz）。听到的就是当前这套 EQ 处理后的效果，测量前后都能用。" />
+            </StackPanel>
+        </Grid>
+
+        <!-- 进度与电平 -->
+        <Grid Grid.Row="1" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel>
+                <ProgressBar x:Name="Progress"
+                             Height="6"
+                             Minimum="0"
+                             Maximum="100"
+                             Value="0" />
+                <TextBlock x:Name="StatusText"
+                           AutomationProperties.AutomationId="CalibrateStatus"
+                           FontSize="12"
+                           Opacity="0.75"
+                           TextWrapping="Wrap"
+                           Margin="0,6,0,0"
+                           Text="准备好了就点「开始测量」。先把音量调到平时听歌的位置。" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Margin="16,0,0,0" VerticalAlignment="Top">
+                <TextBlock Text="麦克风电平" FontSize="11" Opacity="0.6" HorizontalAlignment="Center" />
+                <TextBlock x:Name="LevelText"
+                           FontSize="13"
+                           HorizontalAlignment="Center"
+                           Margin="0,2,0,0"
+                           Text="—" />
+            </StackPanel>
+        </Grid>
+
+        <!-- 曲线 -->
+        <Border Grid.Row="2"
+                Background="#141414"
+                BorderBrush="#33808080"
+                BorderThickness="1"
+                CornerRadius="6">
+            <Canvas x:Name="Plot"
+                    AutomationProperties.AutomationId="CalibratePlot"
+                    Background="Transparent"
+                    ClipToBounds="True"
+                    SizeChanged="OnPlotSizeChanged"
+                    MouseLeftButtonDown="OnPlotMouseDown"
+                    MouseMove="OnPlotMouseMove"
+                    MouseLeftButtonUp="OnPlotMouseUp"
+                    MouseLeave="OnPlotMouseLeave" />
+        </Border>
+
+        <!-- 图例与摘要 -->
+        <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                <Rectangle Width="14" Height="3" Fill="#909090" VerticalAlignment="Center" />
+                <TextBlock Text="实测" FontSize="11" Opacity="0.7" Margin="5,0,14,0" />
+                <Rectangle Width="14" Height="3" Fill="#4F9BFF" VerticalAlignment="Center" />
+                <TextBlock Text="目标" FontSize="11" Opacity="0.7" Margin="5,0,14,0" />
+                <Rectangle Width="14" Height="3" Fill="#FFA94D" VerticalAlignment="Center" />
+                <TextBlock Text="左右 EQ" FontSize="11" Opacity="0.7" Margin="5,0,14,0" />
+                <Rectangle Width="14" Height="3" Fill="#66D97A" VerticalAlignment="Center" />
+                <TextBlock Text="低频矫正（低音层）" FontSize="11" Opacity="0.7" Margin="5,0,0,0" />
+            </StackPanel>
+
+            <TextBlock x:Name="SummaryText"
+                       Grid.Column="1"
+                       AutomationProperties.AutomationId="CalibrateSummary"
+                       FontSize="12"
+                       Opacity="0.8"
+                       HorizontalAlignment="Right"
+                       TextTrimming="CharacterEllipsis" />
+        </Grid>
+
+        <!-- 底部按钮 -->
+        <Grid Grid.Row="4" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock x:Name="HintText"
+                       FontSize="11"
+                       Opacity="0.55"
+                       TextWrapping="Wrap"
+                       VerticalAlignment="Center"
+                       Text="拖动图上的黄色竖线改矫正起点：分界线以上由左右层拟合，以下只由低音层反相。测量期间只拉平左右层、不叠加低音；点「试听扫频」才临时叠加低频。套用后两层都是未保存的改动，主窗口还能撤回。" />
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="ApplyButton"
+                        Content="套用矫正EQ"
+                        AutomationProperties.AutomationId="CalibrateApplyButton"
+                        Click="OnApply"
+                        Padding="16,7"
+                        FontSize="13"
+                        IsEnabled="False"
+                        ToolTip="把主层校正写进「左右」层，同时按当前实测生成 20–100 Hz 低频矫正、整层替换「低音」层；预增益只按左右层算，低频提升不参与。两层都是未保存的改动，主窗口可以撤回" />
+                <Button Content="关闭"
+                        AutomationProperties.AutomationId="CalibrateCloseButton"
+                        Click="OnClose"
+                        Padding="14,7"
+                        Margin="8,0,0,0"
+                        FontSize="13" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</ui:FluentWindow>

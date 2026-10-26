@@ -1,0 +1,30 @@
+au3.keywords.user.udfs=_midi_closeinput _midi_closeoutput \
+	_midi_decrementnrpn _midi_decrementrpn _midi_enuminputs \
+	_midi_enumoutputs _midi_getinputname _midi_getoutputname \
+	_midi_incrementnrpn _midi_incrementrpn _midi_openinput \
+	_midi_openoutput _midi_packaddress _midi_packsize \
+	_midi_read14bitctrlchange _midi_readidreply _midi_readmsg \
+	_midi_readpatchchange _midi_readrolanddt1 _midi_readrpn \
+	_midi_readsysex _midi_readxgdatadump _midi_readxgparamchg \
+	_midi_regdebugfunc _midi_selectpatch _midi_send14bitctrlchange \
+	_midi_sendallnotesoff _midi_sendallsoundoff _midi_sendchannelpressure \
+	_midi_sendcontrolchange _midi_sendidrequest _midi_sendmsg \
+	_midi_sendnoteoff _midi_sendnoteon _midi_sendpitchbend \
+	_midi_sendpolykeypressure _midi_sendprogramchange _midi_sendresetcontrollers \
+	_midi_sendrolanddt1 _midi_sendrolandgsreset _midi_sendrolandrq1 \
+	_midi_sendsysex _midi_sendxgdumprequest _midi_sendxgparamchange \
+	_midi_sendxgparamrequest _midi_sendxgsystemon _midi_setadsr_attack \
+	_midi_setadsr_decay _midi_setadsr_release _midi_setaftertouchdest \
+	_midi_setchancoursetuning _midi_setchanfinetuning _midi_setchorusdepth \
+	_midi_setchorusfeedback _midi_setchorusrate _midi_setchorusreverb \
+	_midi_setchorustype _midi_setcontrollerdest _midi_setdrumchorus \
+	_midi_setdrumlevel _midi_setdrumpan _midi_setdrumpitch \
+	_midi_setdrumproperties _midi_setdrumreverb _midi_setfiltercutoff \
+	_midi_setfilterresonance _midi_setgmmode _midi_setlocalcontrol \
+	_midi_setmidimode _midi_setmoddepthrange _midi_setmstrbalance \
+	_midi_setmstrcoursetuning _midi_setmstrfinetuning _midi_setmstrvolume \
+	_midi_setnrpn _midi_setoctivetuning _midi_setpitchbendsens \
+	_midi_setreverbtime _midi_setreverbtype _midi_setrpn \
+	_midi_setvibratodelay _midi_setvibratodepth _midi_setvibratorate \
+	_midi_shutdown _midi_startup _midi_unpackaddress \
+	_midi_unpacksize 

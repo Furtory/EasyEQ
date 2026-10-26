@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>PeaceWpf</RootNamespace>
+    <AssemblyName>PeaceWpf</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SelfContained>false</SelfContained>
+    <!-- 关于面板显示的版本号；改这里一处，程序里读到的跟着变。 -->
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WPF-UI" />
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PeaceWpf.Core\PeaceWpf.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- AutoEQ 结果库（从 Peace 自带的 AutoEQCompressed5.7z 解开）跟着程序走，运行时按需读。 -->
+    <Content Include="AutoEqData\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 品牌图标（Simple Icons 的矢量路径 + 维基共享资源的字标位图），列表里那个小标就用它 -->
+    <Content Include="AutoEqData\*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="AutoEqData\brand-logos\*.png" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 无延迟防爆音用的 VST（Airwindows ClipOnly3，MIT），运行时由 PeakGuardSetup 复制到 APO 目录 -->
+    <Content Include="Assets\*.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\*.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

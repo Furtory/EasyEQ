@@ -1,0 +1,38 @@
+#include <GUIConstants.au3>
+#include <midi.au3>
+
+Example()
+
+Func Example()
+
+	Local $aiC7[4] = [0x3C, 0x40, 0x43, 0x46]
+	Local $hGUI, $hDevice, $iChannel = 1
+
+	_midi_Startup()
+	$hGUI = GUICreate("dummy")
+	$hDevice = _midi_OpenOutput(0, $hGUI)
+
+	_midi_SelectPatch($hDevice, $iChannel, $PGM_DBAR_ORGAN)
+	For $i = 0 To UBound($aiC7) - 1
+		_midi_SendNoteOn($hDevice, $iChannel, $aiC7[$i], 0x60)
+	Next
+	Sleep(500)
+
+	_midi_SendPitchBend($hDevice, $iChannel, 0)
+	MsgBox(0, "Pitch Bend", "Press OK to set the pitch bend range to 4 semitones")
+
+	_midi_SetPitchBendSens($hDevice, 1, 4)
+	Sleep(1000)
+
+	For $i = 0 To UBound($aiC7) - 1
+		_midi_SendNoteOff($hDevice, $iChannel, $aiC7[$i])
+	Next
+	Sleep(500)
+
+	_midi_SendPitchBend($hDevice, $iChannel, 0x2000)
+	_midi_SelectPatch($hDevice, $iChannel, $PGM_GRAND_PIANO)
+	_midi_SetPitchBendSens($hDevice, 1)
+	_midi_CloseOutput($hDevice)
+	GUIDelete($hGUI)
+	_midi_Shutdown()
+EndFunc

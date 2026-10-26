@@ -1,0 +1,25 @@
+# 构建产物
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.cache
+.vs/
+
+# 本地 NuGet 缓存（NuGet.config 指向它，dotnet restore 会重建）
+.nuget-packages/
+
+# 日志、临时目录、快捷方式
+*.log
+.tmp/
+*.lnk
+
+# 安装包（55 MB，属于可再下载的发布物）
+PeaceSetup.exe
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+
+# 参考用的独立仓库，不跟本项目一起提交
+EasyEQ/

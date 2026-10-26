@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    与 Peace.exe 通信的全部逻辑都放这里：不含任何 WPF 依赖，方便单测。
+    目标用 net10.0-windows 是因为要 P/Invoke user32，但不需要 UseWPF。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>PeaceWpf.Core</RootNamespace>
+    <AssemblyName>PeaceWpf.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 实时频谱要抓系统输出（WASAPI loopback）。FFT 是手写的，这里只用它的采集部分。 -->
+    <PackageReference Include="NAudio.Wasapi" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 自测要量 Smooth 的实际窗口宽度（脉冲法），它是 internal。 -->
+    <InternalsVisibleTo Include="PeaceWpf.Core.SelfTest" />
+  </ItemGroup>
+</Project>

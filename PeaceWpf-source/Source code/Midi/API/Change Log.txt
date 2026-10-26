@@ -1,0 +1,15 @@
+MidiAPI v1.1
+Last Modified: 23rd June 2022
+
+V1.1
+-------------------------------------------------------------------------------------------------------
+Script breaking:
+- Changed the include directives to point towards an include library, rather than a relative path.
+-------------------------------------------------------------------------------------------------------
+Non-script breaking:
+- Added the function reference help file.
+- Updated Dll Callback tags to correctly specify "none" as the return type.
+- Updated the Scite integration script to copy the UDF into the user's include library.
+- Modified the hungarian notation prefixes for some datatypes to better conform with Autoit standards.
+- Removed Tidy and Au3Check directives from the top of all files.
+- Minor formatting modifications to better conform with the UDF spec.

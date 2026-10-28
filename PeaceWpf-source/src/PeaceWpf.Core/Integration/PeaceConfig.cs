@@ -170,6 +170,69 @@ public static class PeaceConfig
         }
     }
 
+    /// <summary>
+    /// 保证预设里有 <c>[General] Id=&lt;id&gt;</c>。Peace 切换配置时按这个 Id 找文件，
+    /// 没有它就切不过去；已有的 Id 行就地改，没有就插在 [General] 段头后面。
+    /// </summary>
+    public static bool EnsureConfigurationId(string path, int id, out string error)
+    {
+        error = string.Empty;
+
+        try
+        {
+            if (!File.Exists(path))
+            {
+                error = "预设文件不存在。";
+                return false;
+            }
+
+            var lines = File.ReadAllLines(path).ToList();
+            var general = lines.FindIndex(line =>
+                line.Trim().Equals("[General]", StringComparison.OrdinalIgnoreCase));
+
+            if (general < 0)
+            {
+                lines.InsertRange(0, new[] { "[General]", $"Id={id}" });
+            }
+            else
+            {
+                var idLine = -1;
+                for (var i = general + 1; i < lines.Count; i++)
+                {
+                    var line = lines[i].Trim();
+                    if (line.StartsWith('[') && line.EndsWith(']'))
+                    {
+                        break;
+                    }
+
+                    if (line.StartsWith("Id=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        idLine = i;
+                        break;
+                    }
+                }
+
+                if (idLine >= 0)
+                {
+                    lines[idLine] = $"Id={id}";
+                }
+                else
+                {
+                    lines.Insert(general + 1, $"Id={id}");
+                }
+            }
+
+            EapoConfig.ClearReadOnly(path);
+            File.WriteAllLines(path, lines, new UTF8Encoding(false));
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            error = ex.GetType().Name + ": " + ex.Message;
+            return false;
+        }
+    }
+
     /// <summary>找一个现成的预设当模板。</summary>
     private static string? FindTemplate(string path)
     {

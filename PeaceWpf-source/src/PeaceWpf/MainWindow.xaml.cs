@@ -3,11 +3,14 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using PeaceWpf.Controls;
 using PeaceWpf.Core.Audio;
 using PeaceWpf.Core.Model;
+using PeaceWpf.Services;
 using PeaceWpf.ViewModels;
 using Wpf.Ui.Controls;
 
@@ -16,10 +19,26 @@ namespace PeaceWpf;
 public partial class MainWindow : FluentWindow
 {
     private bool _closeConfirmed;
+
+    /// <summary>托盘菜单点了「退出软件」：不再问关闭行为，直接走保存确认后退出。</summary>
+    private bool _exitRequested;
+
+    private TrayIconService? _tray;
+
+    /// <summary>气泡只在第一次收进托盘时弹，别每次关都烦人。</summary>
+    private bool _trayHintShown;
+
     private SettingsWindow? _settingsWindow;
     private AutoEqWindow? _autoEqWindow;
     private AutoCalibrateWindow? _calibrateWindow;
+    private AutoSwitchWindow? _autoSwitchWindow;
+
+    /// <summary>全局热键 + 前台进程监听；主窗口一建出来就挂着，收进托盘也不停。</summary>
+    private AutoSwitchService? _autoSwitchService;
     private TutorialOverlay? _tutorialOverlay;
+
+    /// <summary>教程里那个自动EQ 窗口：演示要直接挪它的黄线和滑杆。</summary>
+    private AutoCalibrateWindow? _tutorialCalibrate;
     private Window? _tutorialHostWindow;
     private readonly List<Window> _tutorialOwnedWindows = new();
     private TutorialWindowKind _tutorialCurrentWindow = TutorialWindowKind.Main;
@@ -49,6 +68,27 @@ public partial class MainWindow : FluentWindow
         // 最小宽度不写死，改由内容自然尺寸算出来（见 UpdateContentMinSize）。
         Loaded += OnLoaded;
         SizeChanged += OnContentSizeChanged;
+        PreviewMouseDown += OnMainPreviewMouseDown;
+
+        // 托盘图标从启动就挂着：窗口收进去以后，用户还得靠它回来。
+        // 它建不起来（资源坏了 / WinForms 初始化失败）也不能拦住整个程序启动；
+        // 那种情况下关闭行为会退回「退出软件」，省得窗口藏起来却找不回来。
+        try
+        {
+            _tray = new TrayIconService("电竞调音台");
+            _tray.OpenRequested += (_, _) => ShowFromTray();
+            _tray.SettingsRequested += (_, _) =>
+            {
+                ShowFromTray();
+                OnOpenSettings(this, new RoutedEventArgs());
+            };
+            _tray.ExitRequested += (_, _) => ExitFromTray();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            Debug.WriteLine($"托盘图标创建失败：{ex.Message}");
+            _tray = null;
+        }
     }
 
     private MainViewModel? ViewModel => DataContext as MainViewModel;
@@ -97,7 +137,8 @@ public partial class MainWindow : FluentWindow
 
     private void OnCreatePointRequested(object? sender, PointCreateEventArgs e)
     {
-        e.CreatedPointId = ViewModel?.CreatePoint(e.FrequencyHz) ?? -1;
+        e.CreatedPointId = ViewModel?.CreatePoint(e.FrequencyHz, e.GainDb) ?? -1;
+        ViewModel?.NotifyCalibrationEdited();
     }
 
     private void OnPointMovePreview(object? sender, PointMoveEventArgs e)
@@ -108,16 +149,25 @@ public partial class MainWindow : FluentWindow
     private void OnPointMoveCommitted(object? sender, EventArgs e)
     {
         ViewModel?.CommitPoint();
+        ViewModel?.NotifyCalibrationEdited();
     }
 
     private void OnPointDeleteRequested(object? sender, PointEventArgs e)
     {
         ViewModel?.DeletePoint(e.Id);
+        ViewModel?.NotifyCalibrationEdited();
+    }
+
+    private void OnPointResetRequested(object? sender, PointEventArgs e)
+    {
+        ViewModel?.ResetPoint(e.Id);
+        ViewModel?.NotifyCalibrationEdited();
     }
 
     private void OnQualityChanged(object? sender, PointQualityEventArgs e)
     {
         ViewModel?.ChangePointQuality(e.Id, e.Quality);
+        ViewModel?.NotifyCalibrationEdited();
     }
 
     // ---- 风味（独立叠加层）----
@@ -285,6 +335,9 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        // 教程要演曲线：先把之前测出来的绿线清掉，否则旧测量痕迹会叠在演示曲线上。
+        ClearSweepCurves();
+
         var steps = TutorialSteps.For(course);
         if (course == TutorialCourse.Advanced)
         {
@@ -313,6 +366,12 @@ public partial class MainWindow : FluentWindow
                 vm.PreAmpDb = value;
             }
         };
+
+        // 自动EQ 那两步不画假曲线：直接挪真实窗口里的黄线和滑杆，曲线由它自己算。
+        overlay.CrossoverSet = (hz, quick) => _tutorialCalibrate?.SetTutorialCrossover(hz, quick);
+        overlay.CursorAtCrossover = () => _tutorialCalibrate?.TutorialCrossoverScreenPoint() ?? default;
+        overlay.BoostSet = (percent, quick) => _tutorialCalibrate?.SetTutorialBoost(percent, quick);
+        overlay.CursorAtBoost = () => _tutorialCalibrate?.TutorialBoostScreenPoint() ?? default;
         overlay.AppPreviewAsync = async (bass, lowOnly) =>
         {
             if (ViewModel is not { } vm)
@@ -329,7 +388,7 @@ public partial class MainWindow : FluentWindow
             // 真正出声的是这个播放器：之前只写了 peace.txt，没启动它，所以试听没声音。
             var from = lowOnly ? 20 : 1000;
             var to = lowOnly ? 300 : 20000;
-            if (!StartSweepRange(from, to))
+            if (!StartSweepRange(from, to, TutorialSweepSeconds))
             {
                 await vm.EndTutorialPreviewAsync();
                 return false;
@@ -351,7 +410,7 @@ public partial class MainWindow : FluentWindow
                 return false;
             }
 
-            if (!StartSweepRange(1000, 20000))
+            if (!StartSweepRange(1000, 20000, TutorialSweepSeconds))
             {
                 await vm.EndTutorialPreviewAsync();
                 return false;
@@ -432,6 +491,45 @@ public partial class MainWindow : FluentWindow
         }
     }
 
+    /// <summary>
+    /// 进阶课最后一步：气泡先指「自动切换」按钮，约一秒后把组合窗口打开。
+    /// 组合本来为空时会把教程那两条临时曲线做成一行演示（只在内存里），
+    /// 窗口里只讲一行＝一套声音，热键和进程绑定不替用户录。
+    /// </summary>
+    private async Task OpenTutorialAutoSwitchAfterPauseAsync(MainViewModel viewModel)
+    {
+        await Task.Delay(900);
+        if (_tutorialOverlay is null)
+        {
+            return;
+        }
+
+        var demo = viewModel.EnsureTutorialAutoSwitchDemo();
+
+        AutoSwitchWindow window;
+        if (_autoSwitchWindow is { IsVisible: true } existing)
+        {
+            // 用户自己开着的窗口直接复用，讲完也不替他关。
+            window = existing;
+        }
+        else
+        {
+            window = new AutoSwitchWindow(viewModel) { Owner = this, ShowActivated = false };
+            window.Closed += (_, _) => _tutorialOwnedWindows.Remove(window);
+            _tutorialOwnedWindows.Add(window);
+            window.Show();
+        }
+
+        // 新建窗口构造时已经带上演示行；复用旧窗口则在这里补上。重复调用无副作用。
+        if (demo is not null)
+        {
+            window.AddTutorialRow(demo);
+        }
+
+        await Task.Delay(160);
+        _tutorialHostWindow?.Activate();
+    }
+
     private async Task PrepareTutorialStepAsync(TutorialStep step)
     {
         if (step.TargetId == "ModeMain" && ViewModel is { IsTutorialScenario: true } tutorialVm)
@@ -458,6 +556,12 @@ public partial class MainWindow : FluentWindow
             await Task.Delay(180);
         }
 
+        // 最后一步教「自动切换」：气泡停在主窗口按钮上，等点击动画播完再打开组合窗口。
+        if (step.TargetId == "AutoSwitchButton" && ViewModel is { IsTutorialScenario: true } autoSwitchVm)
+        {
+            _ = OpenTutorialAutoSwitchAfterPauseAsync(autoSwitchVm);
+        }
+
         if (step.Window == _tutorialCurrentWindow)
         {
             return;
@@ -476,6 +580,15 @@ public partial class MainWindow : FluentWindow
         if (window is not null)
         {
             await Task.Delay(160);
+
+            // 自动EQ 窗口一出现就装上演示实测：后面的曲线步骤直接在这个真窗口里演，
+            // 黄线和滑杆都由窗口自己的拟合器重算，遮罩不再另画一套。
+            if (window is AutoCalibrateWindow calibrate)
+            {
+                _tutorialCalibrate = calibrate;
+                calibrate.LoadTutorialMeasurement(TutorialCalibrationDemo.BuildMeasurement());
+            }
+
             _tutorialHostWindow?.Activate();
         }
     }
@@ -565,8 +678,15 @@ public partial class MainWindow : FluentWindow
 
     private void CleanupTutorial()
     {
+        // 复用用户窗口时，演示行是后来补进去的，先从窗口上摘掉；再让视图模型把数据摘掉。
+        if (ViewModel?.TutorialAutoSwitchDemo is { } demo)
+        {
+            _autoSwitchWindow?.RemoveTutorialRow(demo);
+        }
+
         // 先把教程临时换上去的两层还回去，再关窗口。
         ViewModel?.EndTutorialScenario();
+        _tutorialCalibrate = null;
         CloseTutorialWindows();
         _tutorialOverlay = null;
         _tutorialHostWindow = null;
@@ -601,6 +721,28 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
+    /// 打开自动切换：非模态。改组合的时候主界面还能看曲线怎么跟着换，
+    /// 热键和进程绑定也由后台服务盯着。
+    /// </summary>
+    private void OnOpenAutoSwitch(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel is not { } viewModel)
+        {
+            return;
+        }
+
+        if (_autoSwitchWindow is { IsVisible: true })
+        {
+            _autoSwitchWindow.Activate();
+            return;
+        }
+
+        _autoSwitchWindow = new AutoSwitchWindow(viewModel, _autoSwitchService) { Owner = this };
+        _autoSwitchWindow.Closed += (_, _) => _autoSwitchWindow = null;
+        _autoSwitchWindow.Show();
+    }
+
+    /// <summary>
     /// 打开自动EQ：先问校准到哪条曲线，再开扫频窗口。
     /// 模态打开——测量的二十多秒里主窗口的曲线不该被人动，不然 peace.txt 会被试听改写，
     /// 临时拉平的状态就断了。
@@ -613,6 +755,324 @@ public partial class MainWindow : FluentWindow
     /// 和自动EQ里的「试听扫频」走同一条路：临时把「左右 + 低音」合并写进 peace.txt，
     /// 放完再还原。低频层平时不参与主窗口的试听，只有这里会叠上去。
     /// </summary>
+    // ---- 主界面连续扫频的实测曲线 ----
+
+    /// <summary>最多留 5 条，最后一条最新。</summary>
+    private readonly System.Collections.Generic.List<
+        System.Collections.Generic.IReadOnlyList<(double Hz, double Db)>> _sweepCurves = new();
+
+    /// <summary>正在扫频。为真时右键是「停止」，不是「清空」。</summary>
+    private bool _sweeping;
+
+    /// <summary>本次扫频的取消票：右键停止就取消它。</summary>
+    private System.Threading.CancellationTokenSource? _sweepCts;
+
+    /// <summary>扫频刚结束的保护期（TickCount64）：这之前右键不清空，防误删。</summary>
+    private long _sweepGuardUntil;
+
+    /// <summary>中键合并出来的那条；null 表示还没合并过。</summary>
+    private System.Collections.Generic.IReadOnlyList<(double Hz, double Db)>? _sweepAverage;
+
+    private const int MaxSweepCurves = 5;
+
+    /// <summary>
+    /// 扫频放完再收尾：停麦、取出样本、反卷积成一条曲线。
+    /// 反卷积不怕延迟（延迟只改相位），所以不需要和播放对齐。
+    /// </summary>
+    private async Task FinishSweepAsync(
+        MicrophoneCaptureService mic,
+        double fromHz,
+        double toHz,
+        double seconds,
+        CancellationToken token)
+    {
+        try
+        {
+            await RunSweepAnalysisAsync(mic, fromHz, toHz, seconds, token);
+        }
+        finally
+        {
+            // 扫频结束（成功、失败、被停都算）：右键恢复成「清空」，
+            // 但先留 0.5 秒保护——手还按在键上，很容易把刚测出来的那条删掉。
+            _sweeping = false;
+            _sweepGuardUntil = Environment.TickCount64 + 500;
+
+            // 关键：重画一次，只画 _sweepCurves。
+            // 中途停掉时，最后一次画的是「已存曲线 + 正在长的临时线」，
+            // 不重画的话那半截临时线会一直留在图上，看着像测完了。
+            // 正常结束时这一句是无害的：成品已经加进 _sweepCurves 了。
+            Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+        }
+    }
+
+    private async Task RunSweepAnalysisAsync(
+        MicrophoneCaptureService mic,
+        double fromHz,
+        double toHz,
+        double seconds,
+        CancellationToken token)
+    {
+        var rate = mic.SampleRate;
+
+        // 扫频期间先画一条临时线：t 秒时的频率是已知的，切最近 50 ms 量个电平就是一点。
+        // 声卡延迟会让高频端略微错位，所以扫完用反卷积那条覆盖它——先长出来，再落到准确位置。
+        var live = new System.Collections.Generic.List<(double Hz, double Db)>();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var window = Math.Max(1, rate * 50 / 1000);
+        double? liveRef = null;
+        var liveRefLocked = false;
+
+        while (clock.Elapsed.TotalSeconds < seconds + 0.3)
+        {
+            await Task.Delay(50);
+
+            // 右键停止：录音丢掉，不留半截曲线。
+            if (token.IsCancellationRequested)
+            {
+                mic.Stop();
+                mic.Dispose();
+                return;
+            }
+
+            var t = clock.Elapsed.TotalSeconds;
+            if (t >= seconds)
+            {
+                break;
+            }
+
+            var end = mic.SampleCount;
+            if (end < window)
+            {
+                continue;
+            }
+
+            // 扣掉已知的声卡延迟：现在听到的是「延迟之前」那一刻的频率。
+            var heard = Math.Max(0, t - SweepLatencyMemory.Seconds);
+            var hz = fromHz * Math.Pow(toHz / fromHz, heard / seconds);
+
+            // 窗口至少装 3 个周期：20 Hz 的 3 个周期是 150 ms，固定 50 ms 只有 1 个周期，
+            // RMS 会忽高忽低。上限 300 ms，免得一个窗横跨太多频点。
+            var spanMs = Math.Clamp(3000.0 / hz, 50, 300);
+            var span = Math.Max(1, (int)(rate * spanMs / 1000));
+            if (end < span)
+            {
+                continue;
+            }
+
+            var level = mic.WindowRmsDb(end - span, span);
+
+            // 参考：扫到 1 kHz 之前用目前为止的最大值（曲线因此永远在 0 dB 以下，不会顶到图外），
+            // 过了 1 kHz 钉在 1 kHz 那一点上。**存原始电平，画的时候才减参考**——
+            // 这样参考一改，整条曲线立刻统一重算，不会留下台阶。
+            live.Add((hz, level));
+            if (!liveRefLocked && hz >= 1000)
+            {
+                liveRef = level;
+                liveRefLocked = true;
+            }
+            else if (!liveRefLocked)
+            {
+                liveRef = Math.Max(liveRef ?? level, level);
+            }
+
+            var reference0 = liveRef ?? level;
+            var shown = new System.Collections.Generic.List<(double Hz, double Db)>(live.Count);
+            foreach (var (pointHz, pointDb) in live)
+            {
+                shown.Add((pointHz, pointDb - reference0));
+            }
+
+            Graph.SetSweepCurves(WithLive(shown), null);
+        }
+
+        // 扫频本身 + 一点尾巴，等混响散掉。
+        await Task.Delay(TimeSpan.FromSeconds(0.5));
+        mic.Stop();
+        var samples = mic.TakeSamples();
+        mic.Dispose();
+
+        if (samples.Length == 0)
+        {
+            return;
+        }
+
+        var reference = ChirpPreviewPlayer.Build(fromHz, toHz, seconds);
+        var (curve, delayMs) = await Task.Run(() =>
+        {
+            var analyzed = ChirpSweepAnalyzer.Analyze(
+                samples, rate, reference, out var measured, ChirpSweepAnalyzer.PerOctaveFor(seconds));
+            return (analyzed, measured);
+        });
+
+        if (curve is null || curve.Count < 8)
+        {
+            return;
+        }
+
+        // 每次扫频都更新延迟：换了声卡，下一次扫频就自动对上，不用手动清。
+        SweepLatencyMemory.Seconds = delayMs / 1000.0;
+
+        _sweepCurves.Add(curve);
+        while (_sweepCurves.Count > MaxSweepCurves)
+        {
+            _sweepCurves.RemoveAt(0);
+        }
+
+        // 新的一条进来，之前那次合并就过时了。
+        _sweepAverage = null;
+        Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+    }
+
+    /// <summary>中键：把已有的曲线按功率平均成一条。驻波换位置会移动、平均后互相抵消，
+    /// 设备本身的毛病不动、会留下——这就是拿它排除驻波的根据。</summary>
+    private void OnSweepMiddleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Middle)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        _sweepAverage = ChirpSweepAnalyzer.Merge(_sweepCurves);
+        Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+    }
+
+    /// <summary>右键扫频按钮：扫频中是「停止」，扫完了是「清空」，刚扫完的 0.5 秒内什么都不做。</summary>
+    private void OnSweepClear(object sender, MouseButtonEventArgs e)
+    {
+        e.Handled = true;
+
+        // 扫频中：停掉本次录音，别顺手把之前测的几条也删了。
+        // 光取消分析只能让曲线不再长——声音还在放、绿线还在跑，那是「停了一半」。
+        if (_sweeping)
+        {
+            _sweepCts?.Cancel();
+            _sweepPlayer.Stop();
+            StopSweepCursor();
+
+            // 立刻恢复右键语义：这半秒内再点一次，走下面的保护分支，不会误清。
+            _sweeping = false;
+            _sweepGuardUntil = Environment.TickCount64 + 500;
+            return;
+        }
+
+        // 刚扫完的半秒：手多半还按在右键上，当成误触。
+        if (Environment.TickCount64 < _sweepGuardUntil)
+        {
+            return;
+        }
+
+        _sweepCurves.Clear();
+        _sweepAverage = null;
+        Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+    }
+
+    /// <summary>
+    /// 把扫频测出来的绿线全部清掉（进教程时用，免得旧测量痕迹混进演示曲线）。
+    /// 正在测的那一条也要停：只清列表的话，它分析完还会再往图上加回来。
+    /// </summary>
+    private void ClearSweepCurves()
+    {
+        if (_sweeping)
+        {
+            _sweepCts?.Cancel();
+            _sweepPlayer.Stop();
+            StopSweepCursor();
+            _sweeping = false;
+            _sweepGuardUntil = Environment.TickCount64 + 500;
+        }
+
+        _sweepCurves.Clear();
+        _sweepAverage = null;
+        Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+    }
+
+    /// <summary>扫频时长（秒）：输入框和步进都能改，范围 2–60。</summary>
+    /// <summary>平滑档位：关 / 最低 / 稍低 / 重点 / 稍高 / 最高，按窗口半径（点）定义。</summary>
+    private static readonly int[] SweepSmoothWindows = [0, 3, 5, 9, 15, 25];
+
+    private static readonly string[] SweepSmoothNames = ["关", "最低", "稍低", "中度", "稍高", "最高"];
+
+    private int _sweepSmoothIndex;
+
+    /// <summary>当前扫频时长对应的每倍频程点数：越长越密（48 → 384）。</summary>
+    private int SweepPerOctave => ChirpSweepAnalyzer.PerOctaveFor(_sweepSecondsSetting);
+
+    /// <summary>把当前档位和当前分辨率换算成平滑半径交给画图控件。</summary>
+    private void ApplySweepSmoothing()
+    {
+        Graph.SweepSmoothingPoints = SweepSmoothWindows[_sweepSmoothIndex];
+        SweepSmoothButton.Content = "平滑 " + SweepSmoothNames[_sweepSmoothIndex];
+        Graph.InvalidateVisual();
+    }
+
+    private void OnSweepSmoothNext(object sender, RoutedEventArgs e)
+    {
+        _sweepSmoothIndex = (_sweepSmoothIndex + 1) % SweepSmoothWindows.Length;
+        ApplySweepSmoothing();
+    }
+
+    private double _sweepSecondsSetting = ChirpPreviewPlayer.Seconds;
+
+    private void OnSweepSecondsUp(object sender, RoutedEventArgs e) =>
+        SetSweepSeconds(ParseSweepSeconds() + 1);
+
+    private void OnSweepSecondsDown(object sender, RoutedEventArgs e) =>
+        SetSweepSeconds(ParseSweepSeconds() - 1);
+
+    private void OnSweepSecondsCommit(object sender, RoutedEventArgs e) =>
+        SetSweepSeconds(ParseSweepSeconds());
+
+    private void OnSweepSecondsKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+        {
+            return;
+        }
+
+        SetSweepSeconds(ParseSweepSeconds());
+        e.Handled = true;
+    }
+
+    private double ParseSweepSeconds() =>
+        double.TryParse(SweepSecondsBox.Text, out var value) ? value : _sweepSecondsSetting;
+
+    private void SetSweepSeconds(double value)
+    {
+        var clamped = Math.Clamp(Math.Round(value), 2, 99);
+        SweepSecondsBox.Text = clamped.ToString("0");
+
+        if (Math.Abs(clamped - _sweepSecondsSetting) < 0.01)
+        {
+            return;
+        }
+
+        _sweepSecondsSetting = clamped;
+
+        // 时长一变，每倍频程点数就变，旧曲线和新曲线不是同一个分辨率，留着没法叠着看。
+        _sweepCurves.Clear();
+        _sweepAverage = null;
+        Graph.SetSweepCurves(_sweepCurves, _sweepAverage);
+
+        // 平滑半径是按点算的，分辨率变了要重新按当前时长换算。
+        ApplySweepSmoothing();
+    }
+
+    /// <summary>已存的曲线 + 正在长的这条（临时那条排最后，也就是最新、最亮）。</summary>
+    private System.Collections.Generic.List<
+        System.Collections.Generic.IReadOnlyList<(double Hz, double Db)>> WithLive(
+        System.Collections.Generic.List<(double Hz, double Db)> live)
+    {
+        var shown = new System.Collections.Generic.List<
+            System.Collections.Generic.IReadOnlyList<(double Hz, double Db)>>(_sweepCurves);
+        if (live.Count >= 2)
+        {
+            shown.Add(live);
+        }
+
+        return shown;
+    }
+
     private async void OnPlaySweep(object sender, RoutedEventArgs e)
     {
         if (ViewModel is not { } viewModel)
@@ -642,18 +1102,40 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        // 扫频的同时录音：麦克风用自动EQ记住的那只，主界面自己没有设备选择。
+        MicrophoneCaptureService? mic = new MicrophoneCaptureService();
+        if (!mic.Start(CalibrateDeviceMemory.Load()))
+        {
+            mic.Dispose();
+            mic = null;
+        }
+        else
+        {
+            // 丢掉开设备的那一下杂音。反卷积不怕延迟，少这一小段不影响曲线。
+            mic.TakeSamples();
+        }
+
         if (!StartSweepRange(ChirpPreviewPlayer.StartHz, ChirpPreviewPlayer.EndHz))
         {
             viewModel.StatusText = "扫频放不出来：" + (_sweepPlayer.LastError ?? "没有可用的输出设备");
+            mic?.Dispose();
             await viewModel.EndSweepPreviewAsync();
             return;
         }
 
         viewModel.StatusText = viewModel.IsBassLayerEnabled
-            ? "正在放 5 秒扫频：左右 + 低音层，20 Hz 一路升到 20 kHz。"
-            : "正在放 5 秒扫频：只有左右层，20 Hz 一路升到 20 kHz。";
+            ? "正在放一段扫频：左右 + 低音层，20 Hz 一路升到 20 kHz。"
+            : "正在放一段扫频：只有左右层，20 Hz 一路升到 20 kHz。";
 
         StartSweepCursor();
+
+        _sweeping = mic is not null;
+        if (mic is not null)
+        {
+            _sweepCts?.Dispose();
+            _sweepCts = new System.Threading.CancellationTokenSource();
+            _ = FinishSweepAsync(mic, _sweepFromHz, _sweepToHz, _sweepSeconds, _sweepCts.Token);
+        }
 
         var cts = new CancellationTokenSource();
         _sweepRestoreCts = cts;
@@ -661,17 +1143,26 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
+    /// 教程试听的整段时长先按 5 秒折算（暂时值）。
+    /// 教程每遍只等 3.2 秒就停：按用户设置默认的 10 秒折算，1k–20k 要 4.3 秒、
+    /// 20–300 Hz 要 3.9 秒，都会播到一半被掐断；5 秒折算下来约 2.2 / 2.0 秒，能完整放完。
+    /// 只影响教程这两处对比，不动「秒」输入框里的用户设置。
+    /// </summary>
+    private const double TutorialSweepSeconds = 5;
+
+    /// <summary>
     /// 主界面扫频的绿线：ChirpPreviewPlayer 只说明「五秒、20→20k 指数扫频」，不报播放位置，
     /// 所以自己掐表，按 f(t) = f0·(f1/f0)^(t/T) 反推。
+    /// 时长按本次实际播放的频段折算，别再用整段 5 秒。
     /// </summary>
-    /// <summary>按本次实际播放的频段启动绿线：时长也按同一段算，别再用整段 5 秒。</summary>
-    private bool StartSweepRange(double fromHz, double toHz)
+    private bool StartSweepRange(double fromHz, double toHz, double? totalSeconds = null)
     {
         _sweepFromHz = fromHz;
         _sweepToHz = toHz;
         var octaves = Math.Log(toHz / fromHz, 2);
-        _sweepSeconds = Math.Clamp(ChirpPreviewPlayer.Seconds * octaves / 9.97, 1.2, ChirpPreviewPlayer.Seconds);
-        return _sweepPlayer.Play(fromHz, toHz);
+        var total = totalSeconds ?? _sweepSecondsSetting;
+        _sweepSeconds = Math.Clamp(total * octaves / 9.97, 1.2, total);
+        return _sweepPlayer.Play(fromHz, toHz, _sweepSeconds);
     }
 
     private void StartSweepCursor()    {
@@ -735,14 +1226,39 @@ public partial class MainWindow : FluentWindow
 
     private void OnClosed(object? sender, EventArgs e)
     {
+        _autoSwitchService?.Dispose();
+        _autoSwitchService = null;
+
         _sweepRestoreCts?.Cancel();
         _sweepRestoreCts = null;
         _sweepPlayer.Dispose();
+
+        // 托盘图标必须跟着窗口一起收，不然进程退了图标还赖在托盘里。
+        _tray?.Dispose();
+        _tray = null;
 
         // 扫频可能还叠着低频：窗口关了也要把 peace.txt 还原成原样。
         if (ViewModel is { } viewModel)
         {
             _ = viewModel.EndSweepPreviewAsync();
+        }
+
+        // 主窗口一关就是退出软件：有别的窗口开着（设置、教程）也一起收掉，
+        // 免得留下了它们，进程以「没有主窗口」的样子挂在后台退不干净。
+        System.Windows.Application.Current?.Shutdown();
+    }
+
+    private void OnMainPreviewMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        // 点主界面就把自动EQ 收成按钮上的一个小点；点按钮本身不收，交给 Click 呼出。
+        if (AutoCalibrateButton.IsMouseOver)
+        {
+            return;
+        }
+
+        if (_calibrateWindow is { IsCollapsed: false, IsVisible: true } window)
+        {
+            window.Collapse();
         }
     }
 
@@ -753,10 +1269,19 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
-        if (_calibrateWindow is { IsVisible: true })
+        if (_calibrateWindow is { } existing)
         {
-            _calibrateWindow.Activate();
-            return;
+            if (existing.IsCollapsed)
+            {
+                existing.Expand();
+                return;
+            }
+
+            if (existing.IsVisible)
+            {
+                existing.Activate();
+                return;
+            }
         }
 
         _ = OpenAutoCalibrateAsync(viewModel);
@@ -779,10 +1304,28 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        // 进入预览：新建「左右矫正 / 低音矫正」两个预设并切过去，主界面从现在起钉住自动EQ 的曲线。
+        if (!await viewModel.BeginCalibrationPreviewAsync())
+        {
+            AppDialog.Info(
+                this,
+                "自动EQ",
+                "校准要套到「左右」层。当前还有没处理的改动，先保存或放弃，再点一次「自动EQ」。");
+            return;
+        }
+
         var window = new AutoCalibrateWindow(viewModel, target) { Owner = this };
         _calibrateWindow = window;
-        window.Closed += (_, _) => _calibrateWindow = null;
-        window.ShowDialog();
+        window.Closed += (_, _) =>
+        {
+            _calibrateWindow = null;
+            // 没点套用就关窗口 = 取消：切回进入前的配置，删掉这次新建的矫正预设。
+            if (!window.Applied)
+            {
+                viewModel.CancelCalibrationPreview();
+            }
+        };
+        window.Show();
     }
 
     // ---- 预设下拉：右侧抓手的拖动排序 + 右键菜单 ----
@@ -1156,6 +1699,95 @@ public partial class MainWindow : FluentWindow
     {
         UpdateContentMinSize();
         ApplyInitialNineSixteenSize();
+
+        // 窗口尺寸定下来之后再量起点，LOGO 才是真正的正中。
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(PlayStartupAnimation));
+    }
+
+    private bool _startupAnimationPlayed;
+
+    /// <summary>
+    /// 启动动画：全黑遮罩上 LOGO 在正中、软件名在下；停一下，软件名先淡出，
+    /// LOGO 缩小飞向标题栏左上角，最后遮罩淡出，所有控件一起露出来。
+    /// 开机自启最小化启动时不播（窗口根本看不见，播了只是浪费）。
+    /// </summary>
+    private void PlayStartupAnimation()
+    {
+        if (_startupAnimationPlayed)
+        {
+            return;
+        }
+
+        _startupAnimationPlayed = true;
+
+        if (!IsLoaded || WindowState == WindowState.Minimized || SplashLayer.Visibility != Visibility.Visible)
+        {
+            SplashLayer.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var logoSize = SplashLogo.ActualWidth;
+        var targetSize = TitleLogo.ActualWidth;
+
+        // 遮罩层因为什么原因没布局出来，就直接跳过，别让界面永远黑着。
+        if (logoSize <= 0 || targetSize <= 0)
+        {
+            SplashLayer.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // 起点、终点都按真实布局量：改窗口大小或换 DPI 都不会错位。
+        var startCenter = SplashLogo.TranslatePoint(new Point(logoSize / 2, logoSize / 2), this);
+        var targetCenter = TitleLogo.TranslatePoint(new Point(targetSize / 2, targetSize / 2), this);
+        var ratio = targetSize / logoSize;
+
+        var fadeIn = TimeSpan.FromMilliseconds(240);
+        var hold = TimeSpan.FromMilliseconds(620);       // LOGO 停在正中的时间
+        var fly = TimeSpan.FromMilliseconds(660);
+        var reveal = TimeSpan.FromMilliseconds(360);
+
+        // 1) 从全黑里浮出来
+        SplashLogo.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, fadeIn)
+        {
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        });
+        SplashTitle.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, fadeIn)
+        {
+            BeginTime = TimeSpan.FromMilliseconds(90),
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        });
+
+        // 2) 软件名在起飞前收掉，不然缩到角上会糊成一团
+        SplashTitle.BeginAnimation(OpacityProperty, new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(200))
+        {
+            BeginTime = hold - TimeSpan.FromMilliseconds(150),
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn },
+        });
+
+        // 3) LOGO 缩小 + 平移：外圈快、末段收得住，看着像"落位"而不是"滑过去"
+        var arriveEase = new CubicEase { EasingMode = EasingMode.EaseInOut };
+        var dx = targetCenter.X - startCenter.X;
+        var dy = targetCenter.Y - startCenter.Y;
+
+        DoubleAnimation Fly(double from, double to) => new(from, to, fly)
+        {
+            BeginTime = hold,
+            EasingFunction = arriveEase,
+        };
+
+        SplashScale.BeginAnimation(ScaleTransform.ScaleXProperty, Fly(1, ratio));
+        SplashScale.BeginAnimation(ScaleTransform.ScaleYProperty, Fly(1, ratio));
+        SplashShift.BeginAnimation(TranslateTransform.XProperty, Fly(0, dx));
+        SplashShift.BeginAnimation(TranslateTransform.YProperty, Fly(0, dy));
+
+        // 4) 遮罩淡出，控件整体显现；LOGO 这时已经和标题栏里那枚小标重合
+        var fadeOut = new DoubleAnimation(1, 0, reveal)
+        {
+            BeginTime = hold + fly,
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        };
+        fadeOut.Completed += (_, _) => SplashLayer.Visibility = Visibility.Collapsed;
+        SplashLayer.BeginAnimation(OpacityProperty, fadeOut);
     }
 
     private bool _initialSizeApplied;
@@ -1202,6 +1834,13 @@ public partial class MainWindow : FluentWindow
         if (PresentationSource.FromVisual(this) is HwndSource source)
         {
             source.AddHook(OnWindowMessage);
+        }
+
+        // 热键和进程监听挂在窗口句柄上：主窗口收进托盘时句柄还在，热键照样有效。
+        if (ViewModel is { } viewModel)
+        {
+            _autoSwitchService = new AutoSwitchService(viewModel, this);
+            _autoSwitchService.Start();
         }
     }
 
@@ -1390,7 +2029,8 @@ public partial class MainWindow : FluentWindow
         return size;
     }
 
-    protected override void OnClosing(CancelEventArgs e)    {
+    protected override void OnClosing(CancelEventArgs e)
+    {
         base.OnClosing(e);
 
         if (_closeConfirmed)
@@ -1398,13 +2038,86 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
-        if (ViewModel is { } viewModel && !viewModel.ConfirmClose())
+        // 托盘菜单点的「退出软件」：关闭行为已经表过态，不用再问，只确认没保存的改动。
+        if (_exitRequested)
+        {
+            if (!ConfirmCloseBeforeExit())
+            {
+                e.Cancel = true;
+                _exitRequested = false;
+                return;
+            }
+
+            _closeConfirmed = true;
+            FinishClose();
+            return;
+        }
+
+        var action = ResolveCloseAction();
+        if (action is null)
+        {
+            // 询问里按了 Esc：这次不关了，程序原样留着。
+            e.Cancel = true;
+            return;
+        }
+
+        // 收进托盘不是关闭：改动、采集、同步都留在内存里，回来还能接着用。
+        // 但托盘图标没建起来的时候不能藏窗口 —— 那样就找不回来了，只能当成退出。
+        if (action == CloseAction.MinimizeToTray && _tray is not null)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        if (!ConfirmCloseBeforeExit())
         {
             e.Cancel = true;
             return;
         }
 
         _closeConfirmed = true;
+        FinishClose();
+    }
+
+    /// <summary>
+    /// 这次关闭该做什么：记住过就直接用，没记住就问一次。
+    /// 返回 null 表示用户取消了这次关闭。
+    /// </summary>
+    private CloseAction? ResolveCloseAction()
+    {
+        if (ViewModel is not { } viewModel)
+        {
+            return CloseAction.MinimizeToTray;
+        }
+
+        if (viewModel.IsCloseActionRemembered)
+        {
+            return viewModel.CloseAction;
+        }
+
+        var choice = CloseBehaviorWindow.Ask(this, viewModel.CloseAction);
+        if (choice is null)
+        {
+            return null;
+        }
+
+        // 只有「记住选择」才写盘；「仅这一次」什么都不改，下次照问。
+        if (choice.Value.Remember)
+        {
+            viewModel.RememberCloseAction(choice.Value.Action);
+        }
+
+        return choice.Value.Action;
+    }
+
+    /// <summary>真正退出前的保存确认；返回 false 表示用户选择继续编辑。</summary>
+    private bool ConfirmCloseBeforeExit() =>
+        ViewModel is not { } viewModel || viewModel.ConfirmClose();
+
+    /// <summary>退出软件：停采集、存窗口尺寸、摘托盘图标。</summary>
+    private void FinishClose()
+    {
         ViewModel?.Shutdown();
 
         try
@@ -1418,5 +2131,60 @@ public partial class MainWindow : FluentWindow
         {
             Debug.WriteLine($"保存窗口状态失败：{ex.Message}");
         }
+
+        _tray?.Dispose();
+        _tray = null;
+    }
+
+    /// <summary>
+    /// 把窗口收进托盘。用 Hide 而不是 Minimize：任务栏和 Alt+Tab 里都不再留它，
+    /// 需要时从托盘叫回来。
+    /// </summary>
+    private void HideToTray()
+    {
+        Hide();
+
+        if (!_trayHintShown)
+        {
+            _trayHintShown = true;
+            _tray?.ShowHint("还在后台运行", "窗口已收进托盘。左键点图标打开，右键有菜单。");
+        }
+    }
+
+    /// <summary>从托盘回到桌面。托盘左键、托盘菜单、第二个实例激活都走这里。</summary>
+    public void ShowFromTray()
+    {
+        if (!IsVisible)
+        {
+            Show();
+        }
+
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
+    }
+
+    /// <summary>托盘菜单里的「退出软件」。走正常关闭流程，没保存的改动仍会问。</summary>
+    private void ExitFromTray()
+    {
+        if (_closeConfirmed)
+        {
+            return;
+        }
+
+        _exitRequested = true;
+        Close();
+    }
+
+    /// <summary>
+    /// 系统注销 / 关机：别弹询问、也别收托盘，直接放行。
+    /// 否则关机会被一个「要不要最小化到托盘」的问句卡住。
+    /// </summary>
+    public void AllowSessionEnding()
+    {
+        _closeConfirmed = true;
     }
 }

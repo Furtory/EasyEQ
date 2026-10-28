@@ -67,11 +67,18 @@ public sealed class ToneSweepPlayer : IDisposable
     /// <summary>这次播放的总时长（毫秒）。没开始播放时是默认频点表的时长。</summary>
     public double DurationMs { get; private set; } = SweepPlan.TotalMs;
 
-    /// <summary>开始播放。已经在播就直接返回 true。</summary>
+    /// <summary>开始播放（旧入口）。已经在播就直接返回 true。</summary>
     /// <param name="frequencies">要播哪些频点；null 用默认的 61 点表。</param>
-    public bool Start(IReadOnlyList<double>? frequencies = null)
+    public bool Start(IReadOnlyList<double>? frequencies = null) =>
+        Start(SweepSchedule.Build(frequencies ?? SweepPlan.Frequencies));
+
+    /// <summary>
+    /// 按一份时间表播放。分析端拿同一份时间表去分段，两边不会各算各的。
+    /// </summary>
+    /// <param name="schedule">频点和每块的时长。</param>
+    public bool Start(SweepSchedule schedule)
     {
-        var plan = frequencies ?? SweepPlan.Frequencies;
+        ArgumentNullException.ThrowIfNull(schedule);
 
         lock (_gate)
         {
@@ -88,14 +95,9 @@ public sealed class ToneSweepPlayer : IDisposable
 
             try
             {
-                var provider = new SweepSignalProvider(
-                    plan,
-                    SweepPlan.PlaybackSampleRate,
-                    SweepPlan.ToneMs,
-                    SweepPlan.GapMs,
-                    Amplitude);
+                var provider = new SweepSignalProvider(schedule, SweepPlan.PlaybackSampleRate, Amplitude);
 
-                DurationMs = SweepPlan.TotalMsFor(plan.Count);
+                DurationMs = schedule.TotalMs;
 
                 var device = TryGetDefaultDevice();
                 var output = device is null
@@ -258,33 +260,28 @@ public sealed class ToneSweepPlayer : IDisposable
         private const int FadeMs = 8;
 
         private readonly double[] _frequencies;
-        private readonly int _toneSamples;
-        private readonly int _blockSamples;
+        private readonly int[] _blockStarts;
+        private readonly int[] _blockTones;
         private readonly int _fadeSamples;
         private readonly float _amplitude;
         private readonly int _rate;
         private readonly int _syncSamples;
-        private readonly int _syncGapSamples;
         private readonly int _leadSamples;
+        private readonly int _endSamples;
 
         private long _written;
 
-        public SweepSignalProvider(
-            IReadOnlyList<double> frequencies,
-            int sampleRate,
-            int toneMs,
-            int gapMs,
-            float amplitude)
+        public SweepSignalProvider(SweepSchedule schedule, int sampleRate, float amplitude)
         {
-            _frequencies = frequencies.ToArray();
             _rate = sampleRate;
-            _toneSamples = sampleRate * toneMs / 1000;
-            _blockSamples = sampleRate * (toneMs + gapMs) / 1000;
+            _frequencies = schedule.Blocks.Select(block => block.FrequencyHz).ToArray();
+            _blockStarts = schedule.Blocks.Select(block => block.StartSample(sampleRate)).ToArray();
+            _blockTones = schedule.Blocks.Select(block => block.ToneSamples(sampleRate)).ToArray();
             _fadeSamples = sampleRate * FadeMs / 1000;
             _amplitude = amplitude;
             _syncSamples = sampleRate * SweepPlan.SyncMs / 1000;
-            _syncGapSamples = sampleRate * SweepPlan.SyncGapMs / 1000;
-            _leadSamples = _syncSamples + _syncGapSamples;
+            _leadSamples = _syncSamples + (sampleRate * SweepPlan.SyncGapMs / 1000);
+            _endSamples = _blockStarts.Length == 0 ? 0 : _blockStarts[^1] + _blockTones[^1];
 
             WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, Channels);
         }
@@ -293,7 +290,7 @@ public sealed class ToneSweepPlayer : IDisposable
 
         /// <summary>所有频点都写完了。写完之后输出静音。</summary>
         public bool IsFinished =>
-            Interlocked.Read(ref _written) >= (long)_leadSamples + ((long)_blockSamples * _frequencies.Length);
+            Interlocked.Read(ref _written) >= (long)_leadSamples + _endSamples;
 
         public int Read(byte[] buffer, int offset, int count)
         {
@@ -325,7 +322,7 @@ public sealed class ToneSweepPlayer : IDisposable
 
         private float ValueAt(long samplePosition)
         {
-            if (samplePosition < 0 || _blockSamples <= 0)
+            if (samplePosition < 0 || _endSamples <= 0)
             {
                 return 0;
             }
@@ -349,21 +346,21 @@ public sealed class ToneSweepPlayer : IDisposable
                 return (float)(Math.Sin(syncAngle) * syncEnvelope * _amplitude);
             }
 
-            var position = samplePosition - _leadSamples;
-            var block = position / _blockSamples;
-            if (block >= _frequencies.Length)
+            var position = (int)(samplePosition - _leadSamples);
+            if (position >= _endSamples)
             {
                 return 0;
             }
 
-            var phase = (int)(position % _blockSamples);
-            if (phase >= _toneSamples)
+            var block = FindBlock(position);
+            var phase = position - _blockStarts[block];
+            if (phase < 0 || phase >= _blockTones[block])
             {
                 return 0;
             }
 
             var frequency = _frequencies[block];
-            var envelope = Envelope(phase, _toneSamples);
+            var envelope = Envelope(phase, _blockTones[block]);
             if (envelope <= 0)
             {
                 return 0;
@@ -373,23 +370,46 @@ public sealed class ToneSweepPlayer : IDisposable
             return (float)(Math.Sin(angle) * envelope * _amplitude);
         }
 
+        /// <summary>这个位置落在第几块。块长不再相等，只能二分。</summary>
+        private int FindBlock(int position)
+        {
+            var low = 0;
+            var high = _blockStarts.Length - 1;
+            while (low < high)
+            {
+                var middle = (low + high + 1) / 2;
+                if (_blockStarts[middle] <= position)
+                {
+                    low = middle;
+                }
+                else
+                {
+                    high = middle - 1;
+                }
+            }
+
+            return low;
+        }
+
         /// <summary>两头各淡 <see cref="FadeMs"/> 毫秒，切换频点时不会有咔哒声。</summary>
         private float Envelope(int phase, int length)
         {
-            if (_fadeSamples <= 0)
+            if (_fadeSamples <= 0 || length <= 0)
             {
                 return 1;
             }
 
-            if (phase < _fadeSamples)
+            // 块再短也不能让两头淡入淡出碰在一起。
+            var fade = Math.Min(_fadeSamples, Math.Max(1, length / 2));
+            if (phase < fade)
             {
-                return (float)phase / _fadeSamples;
+                return (float)phase / fade;
             }
 
             var remaining = length - phase;
-            if (remaining < _fadeSamples)
+            if (remaining < fade)
             {
-                return (float)remaining / _fadeSamples;
+                return (float)remaining / fade;
             }
 
             return 1;

@@ -62,3 +62,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Breeze 光标（按住曲线时的张开手 / 握拳）
+
+`src/PeaceWpf/Assets/cursor-open.cur`（对应 `openhand`）和 `cursor-grab.cur`（对应 `grabbing`）
+取自 **KDE Breeze** 光标主题的 Windows 移植
+[FelisDiligens/Breeze-Cursors-for-Windows](https://github.com/FelisDiligens/Breeze-Cursors-for-Windows)
+的 `Breeze_Snow/` 目录（白色版本，配合深色界面）。
+
+- 上游：<https://invent.kde.org/plasma/breeze>（KDE Plasma 的 cursors，经 win2xcur 转成 .cur）
+- 许可：**LGPL-3.0-or-later**（该仓库的 `COPYING-ICONS`）
+- Copyright (C) 2014 Uri Herrera <kaisergreymon99@gmail.com> and others
+- 本地没有改动图形，两个文件原样放进资源集（32 / 48 / 64 三档，热点居中）。
+
+这两个光标文件按 LGPL-3.0-or-later 分发；许可证全文见
+<https://www.gnu.org/licenses/lgpl-3.0.html>，对应源码即上述 KDE Breeze 仓库。

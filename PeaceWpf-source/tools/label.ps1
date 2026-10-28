@@ -1,12 +1,12 @@
 param([string[]]$Paths)
 
 if (-not $Paths) {
-  $exe = Get-ChildItem 'D:\AHK' -Recurse -Filter 'PeaceWpf.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+  $exe = Get-ChildItem 'D:\AHK' -Recurse -Filter 'EasyEQ.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
   $Paths = @(
     $exe.FullName,
     (Split-Path $exe.FullName -Parent),
-    "$env:LOCALAPPDATA\PeaceWpf",
-    "$env:LOCALAPPDATA\PeaceWpf\peace.txt.bak",
+    "$env:LOCALAPPDATA\EasyEQ",
+    "$env:LOCALAPPDATA\EasyEQ\peace.txt.bak",
     'C:\Program Files\EqualizerAPO\config',
     'C:\Program Files\EqualizerAPO\config\peace.txt'
   )

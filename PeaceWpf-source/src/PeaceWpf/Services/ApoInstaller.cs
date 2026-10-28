@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using PeaceWpf.Core;
 
 namespace PeaceWpf;
 
@@ -32,7 +33,7 @@ public static class ApoInstaller
     {
         try
         {
-            var folder = Path.Combine(Path.GetTempPath(), "PeaceWpf");
+            var folder = Path.Combine(Path.GetTempPath(), AppPaths.Name);
             Directory.CreateDirectory(folder);
             var path = Path.Combine(folder, "EqualizerAPO-setup.exe");
 

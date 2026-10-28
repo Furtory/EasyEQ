@@ -89,6 +89,13 @@ public sealed class UiState
     public List<string> PresetOrder { get; set; } = new();
 
     /// <summary>
+    /// 「自动切换」的组合：每行一组左右预设 + 低音预设 + 叠加开关 + 热键 + 进程绑定。
+    /// 这个页面上的改动立即写盘，没有撤销；存这里才能跟着设置备份一起走。
+    /// </summary>
+    [JsonPropertyName("autoSwitchProfiles")]
+    public List<UiAutoSwitch> AutoSwitchProfiles { get; set; } = new();
+
+    /// <summary>
     /// 用户手动选的 EqualizerAPO config 目录。null 表示按默认位置找。
     /// 机器相关的路径，导入备份时不跟着走。
     /// </summary>
@@ -96,20 +103,47 @@ public sealed class UiState
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ConfigDirectoryOverride { get; set; }
 
+    /// <summary>
+    /// 自动EQ 上次导入的麦克风矫正曲线文件。null 表示不矫正。
+    /// 机器相关的路径，和 <see cref="ConfigDirectoryOverride"/> 一样：导入备份时不跟着走。
+    /// </summary>
+    [JsonPropertyName("micCalibrationFile")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? MicCalibrationFile { get; set; }
+
     /// <summary>开机自启时是否把主界面显示出来；false 就是最小化启动。</summary>
     [JsonPropertyName("showWindowOnStart")]
     public bool ShowWindowOnStart { get; set; } = true;
+
+    /// <summary>
+    /// 点关闭按钮时做什么：默认收进托盘，程序继续在后台跑。
+    /// 只有用户明确记住过选择才用这个值；没记住时每次关闭都问。
+    /// </summary>
+    [JsonPropertyName("closeAction")]
+    [JsonConverter(typeof(JsonStringEnumConverter<CloseAction>))]
+    public CloseAction CloseAction { get; set; } = CloseAction.MinimizeToTray;
+
+    /// <summary>
+    /// 关闭行为是不是用户记住过的。false 表示还是默认值（问过但只选了「仅这一次」，
+    /// 或者根本没问过）；下次关闭要继续问。
+    /// </summary>
+    [JsonPropertyName("closeActionRemembered")]
+    public bool CloseActionRemembered { get; set; }
+
+    /// <summary>
+    /// 独立模式：打开时本程序写自己的 easyeq.txt，Peace 写它的 peace.txt，互不覆盖；
+    /// 关闭（默认）时写 peace.txt，并把推子同步给正在运行的 Peace。
+    /// </summary>
+    [JsonPropertyName("independentMode")]
+    public bool IndependentMode { get; set; }
 
     /// <summary>旧版本只有一条曲线，读进来之后升级成主层；写回时不再输出这个字段。</summary>
     [JsonPropertyName("points")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<UiPoint>? LegacyPoints { get; set; }
 
-    /// <summary>所在目录：%LOCALAPPDATA%\PeaceWpf。</summary>
-    public static string Directory =>
-        System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PeaceWpf");
+    /// <summary>所在目录：%LOCALAPPDATA%\EasyEQ。</summary>
+    public static string Directory => AppPaths.DataDirectory;
 
     public static string FilePath => System.IO.Path.Combine(Directory, FileName);
 
@@ -143,6 +177,15 @@ public sealed class UiState
                 pair => pair.Key,
                 pair => pair.Value?.Select(item => item.Clone()).ToList() ?? new List<UiFlavor>());
         PresetOrder = other.PresetOrder?.ToList() ?? new List<string>();
+        AutoSwitchProfiles = other.AutoSwitchProfiles is null
+            ? new List<UiAutoSwitch>()
+            : other.AutoSwitchProfiles
+                .Where(item => item is not null)
+                .Select(item => item.Clone())
+                .ToList();
+        IndependentMode = other.IndependentMode;
+        CloseAction = other.CloseAction;
+        CloseActionRemembered = other.CloseActionRemembered;
         LegacyPoints = null;
     }
 
@@ -357,6 +400,16 @@ public sealed class UiFlavor
         Quality = Quality,
         FilterType = FilterType,
     };
+}
+
+/// <summary>点窗口关闭按钮时的行为。</summary>
+public enum CloseAction
+{
+    /// <summary>收进托盘，程序继续在后台跑。默认。</summary>
+    MinimizeToTray = 0,
+
+    /// <summary>直接退出软件。</summary>
+    Exit = 1,
 }
 
 /// <summary>界面状态的读写，出错时静默回退到默认值。</summary>

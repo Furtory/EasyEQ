@@ -109,7 +109,69 @@ Check("S1 默认增益 0", empty.Points.All(p => p.GainDb == 0));
 
 Check("S1 建点成功", empty.TryAdd(1000, out var withPoint, out var created));
 Check("S1 新点增益 0", created.GainDb == 0);
-Check("S1 新点 Q 1.41", Math.Abs(created.Quality - 1.41) < 1e-9);
+Check("S1 空地建点 Q 落在自适应下限", Math.Abs(created.Quality - EqLimits.MinAutoQuality) < 1e-9, created.Quality.ToString());
+
+// 落点就在鼠标处：增益跟着点下去的位置走，不用再拖一次。
+Check("S1 建点可带增益", empty.TryAdd(1000, 5.5, out _, out var gained));
+Check("S1 新点增益跟随落点", Math.Abs(gained.GainDb - 5.5) < 1e-9, gained.GainDb.ToString());
+Check("S1 落点增益越界被夹住", empty.TryAdd(3000, 99, out _, out var hot) && Math.Abs(hot.GainDb - EqLimits.MaxGainDb) < 1e-9);
+
+// Q 按邻居间距自适应：旁边挤就窄，空地就宽。
+var dense = EqPointList.CreateDefault();
+dense.TryAdd(1000, out dense, out _);
+dense.TryAdd(2000, out dense, out _);
+Check("S1 半倍频程处的 Q 约 1.41", dense.TryAdd(1414, out _, out var middle) && Math.Abs(middle.Quality - 1.4142) < 0.01,
+    middle.Quality.ToString());
+Check("S1 邻居近时 Q 变大", middle.Quality > created.Quality);
+Check("S1 紧贴邻居 Q 有上限", dense.TryAdd(1010, out _, out var needle) && Math.Abs(needle.Quality - EqLimits.MaxAutoQuality) < 1e-9,
+    needle.Quality.ToString());
+
+// 按住曲线抓推子：只认对数频率距离以内、最近的那颗普通点。
+var grab = EqPointList.CreateDefault();
+grab.TryAdd(1000, 6, out grab, out var grabFirst);
+Check("S1 抓到频率相近的推子", grab.NearestWithin(1200, 0.5)?.Id == grabFirst.Id);
+Check("S1 超出范围就不抓", grab.NearestWithin(1200, 0.1) is null);
+Check("S1 端点不参与抓取", grab.NearestWithin(20, 2) is null);
+
+grab.TryAdd(2000, 0, out grab, out var grabSecond);
+Check("S1 两颗都在范围内时取更近的", grab.NearestWithin(1800, 1.0)?.Id == grabSecond.Id);
+
+// 按住曲线拖动：曲线要经过鼠标，所以增益是从曲线反推的，不是照抄鼠标高度。
+var through = EqPointList.FromPoints(new[]
+{
+    new EqPoint(1, 20, 0, 0.7, true),
+    new EqPoint(2, 1000, 6, 1.0, false),
+    new EqPoint(3, 2000, 12, 0.5, false),
+    new EqPoint(4, 20000, 0, 0.7, true),
+});
+var draggedPoint = through.Find(2)!;
+const double throughDb = 9;
+var solved = EqResponse.GainForCurveThrough(through, draggedPoint.Id, 1200, throughDb);
+var afterDrag = through.Move(draggedPoint.Id, 1200, solved);
+Check("S1 反推后曲线经过鼠标",
+    Math.Abs(EqResponse.GainAt(afterDrag.ToSnapshot(), 1200) - throughDb) < 0.01,
+    EqResponse.GainAt(afterDrag.ToSnapshot(), 1200).ToString("0.000"));
+
+var neighbours = EqResponse.OthersGainAt(through, 1200, draggedPoint.Id);
+Check("S1 反推扣掉了邻居的贡献", Math.Abs(solved - (throughDb - neighbours)) < 0.02,
+    solved.ToString("0.000"));
+
+var newGain = EqResponse.GainForNewPointAt(through, 1200, throughDb);
+Check("S1 新建点也压在鼠标上",
+    Math.Abs(EqResponse.OthersGainAt(through, 1200) + newGain - throughDb) < 1e-9);
+
+// 架式在拐点只给一半，所以不能直接照抄，要解出来。
+var shelfList = EqPointList.FromPoints(new[]
+{
+    new EqPoint(1, 20, 0, 0.7, true),
+    new EqPoint(2, 1000, 0, 0.7, false, EqLimits.LowShelfFilter),
+    new EqPoint(3, 20000, 0, 0.7, true),
+});
+var shelfPoint = shelfList.Find(2)!;
+var shelfGain = EqResponse.GainForCurveThrough(shelfList, shelfPoint.Id, 1000, 4);
+var afterShelf = shelfList.Move(shelfPoint.Id, null, shelfGain);
+Check("S1 架式推子也能反推", Math.Abs(EqResponse.GainAt(afterShelf.ToSnapshot(), 1000) - 4) < 0.02,
+    EqResponse.GainAt(afterShelf.ToSnapshot(), 1000).ToString("0.000"));
 Check("S1 新点不是端点", !created.IsEndpoint);
 Check("S1 列表 3 个点", withPoint.Count == 3);
 
@@ -398,6 +460,27 @@ Check("S1 预增益能随界面状态落盘读回",
 var preAmpCopy = new UiState();
 preAmpCopy.CopyFrom(preAmpState);
 Check("S1 导入备份会带上预增益", preAmpCopy.TryGetMainPreAmp("B.peace", out var copyPre) && copyPre == 3);
+
+// ---- 关闭行为 ----
+var closeState = new UiState();
+Check("S8 关闭行为默认收进托盘、且还没记住",
+    closeState.CloseAction == CloseAction.MinimizeToTray && !closeState.CloseActionRemembered);
+
+closeState.CloseAction = CloseAction.Exit;
+closeState.CloseActionRemembered = true;
+var closeJson = System.Text.Json.JsonSerializer.Serialize(closeState);
+var closeRound = System.Text.Json.JsonSerializer.Deserialize<UiState>(closeJson)!;
+Check("S8 关闭行为能随界面状态落盘读回",
+    closeRound.CloseAction == CloseAction.Exit && closeRound.CloseActionRemembered);
+
+var closeCopy = new UiState();
+closeCopy.CopyFrom(closeState);
+Check("S8 导入备份会带上关闭行为",
+    closeCopy.CloseAction == CloseAction.Exit && closeCopy.CloseActionRemembered);
+
+var legacyState = System.Text.Json.JsonSerializer.Deserialize<UiState>("{\"balance\":0.5}")!;
+Check("S8 旧配置没有关闭行为时按默认托盘、下次还要问",
+    legacyState.CloseAction == CloseAction.MinimizeToTray && !legacyState.CloseActionRemembered);
 
 // ---- 频响 ----
 var curve = EqResponse.Curve(fromBands.ToSnapshot(), 200);
@@ -815,10 +898,238 @@ var highPoint = analyzed?.Points.OrderBy(point => Math.Abs(Math.Log(point.Freque
 Check("S11 1 kHz 是参考 0 dB", highPoint is not null && Math.Abs(highPoint.LevelDb) < 0.6,
     highPoint?.LevelDb.ToString("0.00") ?? "null");
 
-// 节拍不对时不该硬凑：少播一段就该报错，而不是把频率错位地写进结果。
+// 尾部少一段不再整轮作废：能完整量几块就量几块，最后那个没录全的频点直接不出现在结果里。
+// 16 kHz 往上录不到是常态，为这个把整轮扔掉（界面还会停在半截状态）不划算。
 var truncated = synthetic.Take(synthetic.Length - 48000 * SweepPlan.BlockMs / 1000).ToArray();
 var truncatedResult = SweepAnalyzer.Analyze(truncated, 48000, out var truncatedError);
-Check("S11 少一段会报错", truncatedResult is null && truncatedError is not null, truncatedError ?? "没有报错");
+Check("S11 少一段就少一个点，不报错",
+    truncatedResult is not null && truncatedError is null
+        && truncatedResult.Points.Count == SweepPlan.Frequencies.Count - 1,
+    truncatedError ?? $"points={truncatedResult?.Points.Count}");
+
+// 截断只该砍掉尾巴，前面那些点的读数必须和整段分析一致。
+Check("S11 截断不改变前面各点的读数",
+    truncatedResult is not null && analyzed is not null
+        && Math.Abs(truncatedResult.Points[0].LevelDb - analyzed.Points[0].LevelDb) < 0.5
+        && Math.Abs(truncatedResult.Points[30].LevelDb - analyzed.Points[30].LevelDb) < 0.5,
+    truncatedResult is null ? "null" : truncatedResult.Points[30].LevelDb.ToString("0.00"));
+
+// ---- 相干分析（新引擎）：单频探针、纯度、分带噪声底、局部对齐、MAD 合并 ----
+
+// 单频探针和旧引擎必须用同一把尺子：0.5 幅度的正弦，两边都该是 -9.03 dBFS。
+var toneProbeBuffer = new float[48000 * 2];
+for (var i = 0; i < toneProbeBuffer.Length; i++)
+{
+    toneProbeBuffer[i] = (float)(0.5 * Math.Sin(2 * Math.PI * 1000 * i / 48000.0));
+}
+
+var toneProbeWindow = 48000 * 160 / 1000;
+var toneProbePower = ToneProbe.NarrowbandPower(toneProbeBuffer, 0, toneProbeWindow, 1000, 48000);
+Check("S11 单频探针量 0.5 幅度的 1 kHz 是 -9.03 dBFS",
+    Math.Abs(ToneProbe.PowerToDb(toneProbePower) + 9.03) < 0.1,
+    ToneProbe.PowerToDb(toneProbePower).ToString("0.00"));
+
+var offFrequency = ToneProbe.PowerToDb(ToneProbe.NarrowbandPower(toneProbeBuffer, 0, toneProbeWindow, 2000, 48000));
+Check("S11 单频探针在 2 kHz 上量不到 1 kHz 的音", offFrequency < -60, offFrequency.ToString("0.0"));
+
+// 20 Hz 在 160 ms 里只有 3.2 个周期，整周期截断之后仍然要准。
+var lowProbe = new float[48000];
+for (var i = 0; i < lowProbe.Length; i++)
+{
+    lowProbe[i] = (float)(0.4 * Math.Sin(2 * Math.PI * 20 * i / 48000.0));
+}
+
+var lowPerceived = ToneProbe.PowerToDb(ToneProbe.NarrowbandPower(lowProbe, 0, 48000 * 160 / 1000, 20, 48000));
+var lowExpected = 20 * Math.Log10(0.4 / Math.Sqrt(2));
+Check("S11 3.2 个周期也能量准 20 Hz", Math.Abs(lowPerceived - lowExpected) < 0.3,
+    $"{lowPerceived:0.00} / 期望 {lowExpected:0.00}");
+
+Check("S11 纯音的纯度接近 0 dB",
+    Math.Abs(10 * Math.Log10(toneProbePower / ToneProbe.WindowPower(toneProbeBuffer, 0, toneProbeWindow))) < 0.5,
+    (10 * Math.Log10(toneProbePower / ToneProbe.WindowPower(toneProbeBuffer, 0, toneProbeWindow))).ToString("0.00"));
+
+// 等功率的宽带噪声混进去：纯度应掉到 -3 dB 附近，而目标频点的电平不变。
+var noisyProbe = (float[])toneProbeBuffer.Clone();
+var noiseRandom = new Random(20261028);
+var noisePeak = Math.Sqrt(3 * 0.125);
+for (var i = 0; i < toneProbeWindow; i++)
+{
+    noisyProbe[i] += (float)((noiseRandom.NextDouble() - 0.5) * 2 * noisePeak);
+}
+
+var noisyPurity = 10 * Math.Log10(
+    ToneProbe.NarrowbandPower(noisyProbe, 0, toneProbeWindow, 1000, 48000)
+    / ToneProbe.WindowPower(noisyProbe, 0, toneProbeWindow));
+Check("S11 等功率噪声把纯度压到 -3 dB 附近", Math.Abs(noisyPurity + 3) < 1.0, noisyPurity.ToString("0.00"));
+Check("S11 混进噪声不改变目标频点的电平",
+    Math.Abs(ToneProbe.PowerToDb(ToneProbe.NarrowbandPower(noisyProbe, 0, toneProbeWindow, 1000, 48000)) + 9.03) < 0.3,
+    ToneProbe.PowerToDb(ToneProbe.NarrowbandPower(noisyProbe, 0, toneProbeWindow, 1000, 48000)).ToString("0.00"));
+
+// 时间表：旧的必须一比一还原，新的只动低频。
+var legacySchedule = SweepSchedule.Build(SweepPlan.Frequencies, SweepTiming.Legacy);
+Check("S11 旧时间表总时长 23780 ms", Math.Abs(legacySchedule.TotalMs - 23780) < 1, legacySchedule.TotalMs.ToString("0"));
+Check("S11 旧时间表是均匀的", legacySchedule.IsUniform);
+
+var coherentSchedule = SweepSchedule.Build(SweepPlan.Frequencies, SweepTiming.Coherent);
+Check("S11 新时间表把 20 Hz 加长到 500 ms", coherentSchedule.Blocks[0].ToneMs == 500,
+    coherentSchedule.Blocks[0].ToneMs.ToString());
+Check("S11 新时间表 40 Hz 以上回到 260 ms",
+    coherentSchedule.Blocks.Where(block => block.FrequencyHz >= 40).All(block => block.ToneMs == 260));
+Check("S11 新时间表只比旧的长几百毫秒",
+    coherentSchedule.TotalMs > legacySchedule.TotalMs
+    && coherentSchedule.TotalMs < legacySchedule.TotalMs + 3000,
+    (coherentSchedule.TotalMs - legacySchedule.TotalMs).ToString("0") + " ms");
+Check("S11 时间表块与块首尾相接",
+    coherentSchedule.Blocks.Zip(coherentSchedule.Blocks.Skip(1)).All(pair =>
+        Math.Abs(pair.Second.StartMs - (pair.First.StartMs + pair.First.ToneMs + pair.First.GapMs)) < 1e-9));
+Check("S11 测量窗落在响声里",
+    coherentSchedule.Blocks.All(block => block.MeasureStartMs >= 8 && block.MeasureEndMs <= block.ToneMs - 8));
+
+// 相干分析跑同一段合成录音：形状要和旧引擎一致，但多出纯度和对齐偏移。
+var coherentClean = SweepAnalyzer.AnalyzeCoherent(
+    synthetic, 48000, out var coherentError, SweepPlan.Frequencies, legacySchedule);
+Check("S11 相干分析能出 61 段", coherentClean is not null, coherentError);
+
+var coherentLow = coherentClean?.Points.OrderBy(point => Math.Abs(Math.Log(point.FrequencyHz / 100))).First();
+Check("S11 相干分析 100 Hz 测到 -6 dB",
+    coherentLow is not null && Math.Abs(coherentLow.LevelDb + 6) < 1.0,
+    coherentLow?.LevelDb.ToString("0.00") ?? "null");
+
+var coherentReference = coherentClean?.Points.OrderBy(point => Math.Abs(Math.Log(point.FrequencyHz / 1000))).First();
+Check("S11 相干分析 1 kHz 是参考 0 dB",
+    coherentReference is not null && Math.Abs(coherentReference.LevelDb) < 0.6,
+    coherentReference?.LevelDb.ToString("0.00") ?? "null");
+
+Check("S11 相干分析把干净录音全标成干净",
+    coherentClean is not null && coherentClean.Points.All(point => point.IsClean),
+    coherentClean?.DirtyCount.ToString() ?? "null");
+Check("S11 合成信号没有漂移，对齐偏移都在 1 ms 以内",
+    coherentClean is not null && coherentClean.Points.All(point => Math.Abs(point.AlignOffsetMs) < 1));
+Check("S11 相干分析给出了每个频点自己的噪声底",
+    coherentClean?.NoiseFloorsDb?.Count == SweepPlan.Frequencies.Count,
+    coherentClean?.NoiseFloorsDb?.Count.ToString() ?? "null");
+
+// 关键对比：503 Hz 那一窗塞进很响的宽带噪声（模拟有人说话）。
+// 旧引擎把噪声一起算进去，读数被垫高；新引擎只探 503 Hz，读数不动，并且把纯度标出来。
+var quietDip = SynthesizeSweep(48000, hz => hz is > 490 and < 520 ? -24 : 0);
+var dirtyDip = (float[])quietDip.Clone();
+var targetIndex = SweepPlan.NearestIndex(503);
+var sweepLeadSamples = 48000 * (SweepPlan.SyncMs + SweepPlan.SyncGapMs) / 1000;
+var sweepBlockSamples = 48000 * SweepPlan.BlockMs / 1000;
+var interferenceStart = sweepLeadSamples + (targetIndex * sweepBlockSamples) + (48000 * SweepPlan.MeasureSkipMs / 1000);
+var interferenceEnd = sweepLeadSamples + (targetIndex * sweepBlockSamples) + (48000 * SweepPlan.MeasureEndMs / 1000);
+var interferenceRandom = new Random(20261028);
+for (var i = interferenceStart; i < interferenceEnd; i++)
+{
+    dirtyDip[i] += (float)((interferenceRandom.NextDouble() - 0.5) * 0.1);
+}
+
+var legacyCleanDip = SweepAnalyzer.Analyze(quietDip, 48000, out _);
+var legacyDirtyDip = SweepAnalyzer.Analyze(dirtyDip, 48000, out _);
+var coherentCleanDip = SweepAnalyzer.AnalyzeCoherent(quietDip, 48000, out _, SweepPlan.Frequencies, legacySchedule);
+var coherentDirtyDip = SweepAnalyzer.AnalyzeCoherent(dirtyDip, 48000, out _, SweepPlan.Frequencies, legacySchedule);
+
+var legacyCleanPoint = legacyCleanDip?.Points[targetIndex];
+var legacyDirtyPoint = legacyDirtyDip?.Points[targetIndex];
+var coherentCleanPoint = coherentCleanDip?.Points[targetIndex];
+var coherentDirtyPoint = coherentDirtyDip?.Points[targetIndex];
+
+Check("S11 旧引擎被窗内噪声垫高了 5 dB 以上",
+    legacyCleanPoint is not null && legacyDirtyPoint is not null
+    && legacyDirtyPoint.LevelDb - legacyCleanPoint.LevelDb > 5,
+    legacyCleanPoint is null || legacyDirtyPoint is null
+        ? "null"
+        : (legacyDirtyPoint.LevelDb - legacyCleanPoint.LevelDb).ToString("0.0") + " dB");
+
+Check("S11 相干分析在同样的噪声下读数几乎不动",
+    coherentCleanPoint is not null && coherentDirtyPoint is not null
+    && Math.Abs(coherentDirtyPoint.LevelDb - coherentCleanPoint.LevelDb) < 1.5,
+    coherentCleanPoint is null || coherentDirtyPoint is null
+        ? "null"
+        : Math.Abs(coherentDirtyPoint.LevelDb - coherentCleanPoint.LevelDb).ToString("0.00") + " dB");
+
+Check("S11 相干分析把被污染的频点标成不可用",
+    coherentDirtyPoint is not null && !coherentDirtyPoint.IsClean && !coherentDirtyPoint.IsUsable,
+    coherentDirtyPoint is null ? "null" : coherentDirtyPoint.PurityDb.ToString("0.0") + " dB");
+
+Check("S11 被污染的只有那一个频点",
+    coherentDirtyDip?.DirtyCount == 1, coherentDirtyDip?.DirtyCount.ToString() ?? "null");
+
+// 两遍差太多时，中位数退化成平均，MAD 那条路按纯度选干净的那遍。
+var mergeFrequencies = new[] { 100.0, 1000.0 };
+
+SweepMeasurement BuildPass(double hundred, double purity)
+{
+    var passPoints = new List<MeasurementPoint>
+    {
+        new(100, hundred, 30, hundred) { PurityDb = purity },
+        new(1000, 0, 30, 0) { PurityDb = 0 },
+    };
+    return new SweepMeasurement(passPoints, -60, 48000, mergeFrequencies);
+}
+
+var mergedOutlier = SweepMeasureService.Merge(new[] { BuildPass(-5, 0), BuildPass(12, -20) });
+Check("S11 两遍差太多时按纯度选干净的那遍",
+    Math.Abs(mergedOutlier.Points[0].LevelDb + 5) < 0.01,
+    mergedOutlier.Points[0].LevelDb.ToString("0.00"));
+
+var mergedClose = SweepMeasureService.Merge(new[] { BuildPass(-5, 0), BuildPass(-4, 0) });
+Check("S11 两遍接近时取中位（偶数遍取偏后那个，不做平均）",
+    Math.Abs(mergedClose.Points[0].LevelDb + 4) < 0.01,
+    mergedClose.Points[0].LevelDb.ToString("0.00"));
+
+// 引擎开关：旧算法必须还在，随时能切回去做对比。
+var previousEngine = SweepAnalyzer.Engine;
+SweepAnalyzer.Engine = SweepEngine.BroadbandRms;
+var autoLegacy = SweepAnalyzer.AnalyzeAuto(synthetic, 48000, out _, SweepPlan.Frequencies, legacySchedule);
+SweepAnalyzer.Engine = SweepEngine.Coherent;
+var autoCoherent = SweepAnalyzer.AnalyzeAuto(synthetic, 48000, out _, SweepPlan.Frequencies, legacySchedule);
+SweepAnalyzer.Engine = previousEngine;
+
+Check("S11 引擎开关能切回旧算法",
+    autoLegacy is not null && double.IsNaN(autoLegacy.Points[0].PurityDb));
+Check("S11 引擎开关默认走相干分析",
+    autoCoherent is not null && !double.IsNaN(autoCoherent.Points[0].PurityDb));
+
+// ---- 实测灰线的平滑插值 ----
+
+var smoothNodes = new List<(double Hz, double Db)> { (100, -6), (1000, 0), (10000, 3) };
+var smoothCurve = SmoothCurve.Build(smoothNodes);
+Check("S16 三个点能连成曲线", smoothCurve is not null);
+Check("S16 曲线穿过每一个输入点",
+    smoothCurve is not null && smoothNodes.All(node => Math.Abs(smoothCurve.Evaluate(node.Hz) - node.Db) < 1e-9),
+    smoothCurve is null
+        ? "null"
+        : string.Join(",", smoothNodes.Select(node => smoothCurve.Evaluate(node.Hz).ToString("0.0000"))));
+
+var smoothSampled = smoothCurve?.Sample(200) ?? Array.Empty<(double Hz, double Db)>();
+Check("S16 采样点数对得上", smoothSampled.Count == 201, smoothSampled.Count.ToString());
+Check("S16 采样首尾落在两端点上",
+    smoothSampled.Count == 201
+    && Math.Abs(smoothSampled[0].Hz - 100) < 1e-6
+    && Math.Abs(smoothSampled[^1].Hz - 10000) < 1e-6);
+
+// 一个又尖又高的峰，普通三次样条会在两侧甩出负值；单调三次不许过冲。
+var peakNodes = new List<(double Hz, double Db)> { (100, 0), (200, 10), (400, 0) };
+var peakCurve = SmoothCurve.Build(peakNodes);
+var peakSamples = peakCurve?.Sample(400) ?? Array.Empty<(double Hz, double Db)>();
+Check("S16 峰两侧不会冲过头",
+    peakSamples.Count > 0 && peakSamples.All(point => point.Db <= 10 + 1e-9 && point.Db >= -1e-9),
+    peakSamples.Count == 0
+        ? "null"
+        : $"{peakSamples.Min(point => point.Db):0.000}..{peakSamples.Max(point => point.Db):0.000}");
+
+// 单调数据单调输出，不能因为插值在中间冒出一个凸起。
+var monotoneNodes = new List<(double Hz, double Db)> { (20, -20), (200, -5), (2000, 0), (20000, 5) };
+var monotoneCurve = SmoothCurve.Build(monotoneNodes);
+var monotoneSamples = monotoneCurve?.Sample(300) ?? Array.Empty<(double Hz, double Db)>();
+Check("S16 单调数据插完还是单调",
+    monotoneSamples.Count > 1
+    && monotoneSamples.Zip(monotoneSamples.Skip(1)).All(pair => pair.Second.Db >= pair.First.Db - 1e-9));
+
+Check("S16 一个点连不成曲线", SmoothCurve.Build(new List<(double Hz, double Db)> { (100, 0) }) is null);
+Check("S16 重复频率不会除零",
+    SmoothCurve.Build(new List<(double Hz, double Db)> { (100, 0), (100, 3), (1000, 1) }) is not null);
 
 // 目标曲线
 Check("S11 平直全 0", TargetCurve.GainAt(CalibrationTargetKind.Flat, 500) == 0);
@@ -827,12 +1138,96 @@ Check("S11 哈曼 20 Hz 约 +5.8", Math.Abs(TargetCurve.GainAt(CalibrationTarget
 Check("S11 哈曼 2 kHz 有凸起", TargetCurve.GainAt(CalibrationTargetKind.HarmanInEar, 2000) > 1.0);
 Check("S11 哈曼 5 kHz 是凹的", TargetCurve.GainAt(CalibrationTargetKind.HarmanInEar, 5000) < 0);
 
+// 麦克风矫正曲线：表头要跳过、k 后缀要认、1 kHz 锚点不能跟着漂。
+var micText = string.Join('\n', new[]
+{
+    "\"Sens Factor =-0.4dB, SERNO: 7050\"",
+    "# 这一行是注释",
+    "20, -1.5",
+    "100\t0.5",
+    "10k 3.0",
+});
+
+var micCurve = MicCalibrationCurve.Parse(micText, "test.txt");
+Check("S11 麦克风曲线跳过表头", micCurve.PointCount == 3, micCurve.PointCount.ToString());
+Check("S11 麦克风曲线留住文件名", micCurve.Name == "test.txt");
+Check("S11 麦克风曲线认 k 后缀", Math.Abs(micCurve.MaxFrequencyHz - 10000) < 0.01, micCurve.MaxFrequencyHz.ToString("0"));
+Check("S11 麦克风曲线逗号、制表符都能分列",
+    Math.Abs(micCurve.GainAt(20) + 1.5) < 1e-9 && Math.Abs(micCurve.GainAt(100) - 0.5) < 1e-9);
+Check("S11 麦克风曲线端点以外沿用端点值",
+    Math.Abs(micCurve.GainAt(10) + 1.5) < 1e-9 && Math.Abs(micCurve.GainAt(20000) - 3.0) < 1e-9);
+
+// REW 拿 * 标 0 dB 参考点，那一行是数据不是注释。
+var starred = MicCalibrationCurve.Parse("*1000 0.0\n20 -1\n100 1");
+Check("S11 星号开头的那行按数据读", starred.PointCount == 3 && Math.Abs(starred.GainAt(1000)) < 1e-9,
+    starred.PointCount.ToString());
+
+// 100 Hz 到 10 kHz 的几何中点是 1 kHz，插值结果该是两端的平均值——这才是对数坐标里的直线。
+var micMidDb = micCurve.GainAt(1000);
+Check("S11 麦克风曲线按对数插值", Math.Abs(micMidDb - 1.75) < 1e-6, micMidDb.ToString("0.000"));
+
+var micMeasurement = new SweepMeasurement(
+    new List<MeasurementPoint>
+    {
+        new(100, 0, 30, -60),
+        new(1000, 0, 30, -60),
+        new(10000, 0, 30, -60),
+    },
+    -90,
+    48000,
+    new List<double> { 100, 1000, 10000 });
+var micCorrected = micCurve.ApplyTo(micMeasurement);
+Check("S11 矫正后 1 kHz 锚点不动",
+    Math.Abs(micCorrected.Points[1].LevelDb) < 1e-9, micCorrected.Points[1].LevelDb.ToString("0.000"));
+Check("S11 矫正后的形状是减掉麦克风偏差",
+    Math.Abs(micCorrected.Points[2].LevelDb + 1.25) < 1e-9
+    && Math.Abs(micCorrected.Points[0].LevelDb - 1.25) < 1e-9,
+    $"{micCorrected.Points[0].LevelDb:0.000} / {micCorrected.Points[2].LevelDb:0.000}");
+
+var micParseFailed = false;
+try
+{
+    MicCalibrationCurve.Parse("这一行不是数据");
+}
+catch (FormatException)
+{
+    micParseFailed = true;
+}
+
+Check("S11 认不出的文件报错而不是给条假曲线", micParseFailed);
+
 // 拟合：平直目标 + 低频凹陷 → 应该在低频补回来。
 if (analyzed is not null)
 {
     var plan = EqCurveFitter.Fit(CalibrationTargetKind.Flat, analyzed);
     Check("S11 拟合成 23 段", plan.FilterCount == 23, plan.FilterCount.ToString());
     Check("S11 预增益不为正", plan.PreAmpDb <= 0, plan.PreAmpDb.ToString("0.0"));
+
+    // 左下角刻度条：0 = 只削不提，曲线上不能出现正增益；给 3 就最多 +3。
+    var noBoostPlan = EqCurveFitter.Fit(CalibrationTargetKind.Flat, analyzed, maxBoostDb: 0);
+    Check("S11 提升上限 0 时没有正增益",
+        noBoostPlan.Points.Points.All(point => point.GainDb <= 0.001),
+        noBoostPlan.Points.Points.Max(point => point.GainDb).ToString("0.00"));
+
+    var boost3Plan = EqCurveFitter.Fit(CalibrationTargetKind.Flat, analyzed, maxBoostDb: 3);
+    Check("S11 提升上限 3 时最多 +3",
+        boost3Plan.Points.Points.All(point => point.GainDb <= 3.05),
+        boost3Plan.Points.Points.Max(point => point.GainDb).ToString("0.00"));
+
+    // 补偿档：前一半补整体音量（预增益抬到 0），后一半放开提升、允许削波。
+    var compBase = EqCurveFitter.Fit(CalibrationTargetKind.HarmanInEar, analyzed);
+    var comp50 = EqCurveFitter.Fit(CalibrationTargetKind.HarmanInEar, analyzed, compensationPercent: 50);
+    var comp100 = EqCurveFitter.Fit(CalibrationTargetKind.HarmanInEar, analyzed, compensationPercent: 100);
+    Check("S11 补偿 0 没有削波", compBase.MaxClipDb <= 0.001, compBase.MaxClipDb.ToString("0.00"));
+    Check("S11 补偿 50 预增益归零", Math.Abs(comp50.PreAmpDb) < 0.06, comp50.PreAmpDb.ToString("0.0"));
+    Check("S11 补偿 100 预增益 0 且出现削波",
+        Math.Abs(comp100.PreAmpDb) < 0.001 && comp100.MaxClipDb > 0.05,
+        $"{comp100.PreAmpDb:0.0}/{comp100.MaxClipDb:0.00}");
+    Check("S11 预增益随补偿单调抬升",
+        compBase.PreAmpDb <= comp50.PreAmpDb && comp50.PreAmpDb <= comp100.PreAmpDb,
+        $"{compBase.PreAmpDb:0.0}/{comp50.PreAmpDb:0.0}/{comp100.PreAmpDb:0.0}");
+    Check("S11 削波比例在 0 到 1 之间",
+        comp100.ClippedFraction is >= 0 and <= 1, comp100.ClippedFraction.ToString("0.00"));
 
     // 段数不该写死：三档疏密各给各的段数，Q 跟着段距走，三档都能拟合。
     // 所有档都从 100 Hz 起：低频补不出来，别浪费推子。
@@ -1616,6 +2011,131 @@ Check("S12 空名字不崩", AutoEqBrand.TryMatch(null) is null && AutoEqBrand.T
         "S14 保存后风味成为新的基线",
         !flavorDraft.IsDirty && Math.Abs(flavorDraft.SavedFlavors[5].GainDb - 2) < 1e-9);
     flavorDraft.End();
+}
+
+// ---- S15 独立模式：文件名与 config.txt 的 Include 二选一 ----
+Check("S15 关闭时写 peace.txt", EapoConfig.FileNameFor(false) == "peace.txt");
+Check("S15 打开时写 easyeq.txt", EapoConfig.FileNameFor(true) == EapoConfig.IndependentFileName);
+
+var modeScratch = CreateScratchDirectory();
+try
+{
+    var entry = Path.Combine(modeScratch, "config.txt");
+    File.WriteAllText(entry, "Include: peace.txt\nInclude: protect.txt\n");
+
+    var toIndependent = ApoSetup.SwitchInclude(
+        modeScratch, EapoConfig.IndependentFileName, EapoConfig.FileName, modeScratch);
+    var text = File.ReadAllText(entry);
+    Check("S15 切独立模式没报错", toIndependent.Error is null, toIndependent.Error);
+    Check("S15 独立模式挂上 easyeq.txt", ApoSetup.IsIncluded(text, EapoConfig.IndependentFileName));
+    Check("S15 独立模式去掉 peace.txt", !ApoSetup.IsIncluded(text, EapoConfig.FileName));
+    Check("S15 别动 protect.txt", ApoSetup.IsIncluded(text, "protect.txt"));
+
+    var back = ApoSetup.SwitchInclude(
+        modeScratch, EapoConfig.FileName, EapoConfig.IndependentFileName, modeScratch);
+    text = File.ReadAllText(entry);
+    Check("S15 切回没报错", back.Error is null, back.Error);
+    Check("S15 切回挂上 peace.txt", ApoSetup.IsIncluded(text, EapoConfig.FileName));
+    Check("S15 切回去掉 easyeq.txt", !ApoSetup.IsIncluded(text, EapoConfig.IndependentFileName));
+
+    var alreadyThere = ApoSetup.SwitchInclude(
+        modeScratch, EapoConfig.FileName, EapoConfig.IndependentFileName, modeScratch);
+    Check("S15 已经就位时不再改文件", !alreadyThere.Changed && alreadyThere.Error is null, alreadyThere.Error);
+
+    // 带子目录的旧行也要认出来，不然切完两个都挂着，两层 EQ 会叠加。
+    File.WriteAllText(entry, "Include: Sub\\peace.txt\n");
+    var nested = ApoSetup.SwitchInclude(
+        modeScratch, EapoConfig.IndependentFileName, EapoConfig.FileName, modeScratch);
+    text = File.ReadAllText(entry);
+    Check(
+        "S15 子目录里的旧行也认得出",
+        nested.Error is null && !text.Contains("Sub\\peace.txt", StringComparison.OrdinalIgnoreCase),
+        text);
+}
+finally
+{
+    TryDelete(modeScratch);
+}
+
+// ---- 低频采信：信噪比要够，孤立点不要 ----
+{
+    var points = new List<MeasurementPoint>();
+    var noisy = new[] { 31.7, 35.6, 44.9, 50.4, 71.3, 89.8 };
+    foreach (var hz in SweepPlan.Frequencies)
+    {
+        var snr = 30.0;
+        var level = 0.0;
+
+        if (Math.Abs(hz - 40) < 0.3)
+        {
+            // 孤立假峰：读数很高，但左右邻点全是噪声。
+            snr = 12;
+            level = 20;
+        }
+        else if (Math.Abs(hz - 56.6) < 0.3)
+        {
+            // 信噪比不够，邻居正常。
+            snr = 8;
+            level = 12;
+        }
+        else if (noisy.Any(n => Math.Abs(hz - n) < 0.3))
+        {
+            snr = 4;
+        }
+
+        points.Add(new MeasurementPoint(hz, level, snr, level));
+    }
+
+    var mask = EqCurveFitter.TrustedLowMask(points, 100);
+    int Index(double hz) => points.FindIndex(p => Math.Abs(p.FrequencyHz - hz) < 0.3);
+
+    Check(
+        "S16 低频信噪比不够的点不采信",
+        !mask[Index(56.6)],
+        $"snr={points[Index(56.6)].SnrDb:0}");
+    Check(
+        "S16 低频孤立点即使读得高也不采信",
+        !mask[Index(40)],
+        $"snr={points[Index(40)].SnrDb:0} level={points[Index(40)].LevelDb:0}");
+    Check(
+        "S16 连续可信的低频点保留",
+        mask[Index(20)] && mask[Index(22.4)] && mask[Index(28.3)],
+        string.Join(",", new[] { 20, 22.4, 28.3 }.Select(h => mask[Index(h)] ? "Y" : "n")));
+}
+
+// ---- 低频测不到时的兜底补偿 ----
+{
+    var points = new List<MeasurementPoint>();
+    foreach (var hz in SweepPlan.Frequencies)
+    {
+        // 低频整段贴着噪声底，中高频正常。
+        var snr = hz < 100 ? 4.0 : 40.0;
+        var level = hz < 100 ? -30.0 : 0.0;
+        points.Add(new MeasurementPoint(hz, level, snr, level));
+    }
+
+    var measurement = new SweepMeasurement(points, -70, 48000, SweepPlan.Frequencies);
+
+    var half = EqCurveFitter.FitBass(
+        CalibrationTargetKind.Flat, measurement, null, 0,
+        ceilingHz: 100, quick: false, compensationPercent: 50);
+    var halfSnapshot = half.ToSnapshot();
+    var lowEnd = EqResponse.GainAt(halfSnapshot, 25);
+    var topEnd = EqResponse.GainAt(halfSnapshot, 100);
+
+    Check(
+        "S17 低频测不到时按滑杆生成提升曲线",
+        lowEnd > 6 && lowEnd < 16,
+        $"25Hz={lowEnd:0.0} dB");
+    Check(
+        "S17 兜底曲线在矫正起点附近回落到 0",
+        Math.Abs(topEnd) < 2.5,
+        $"100Hz={topEnd:0.0} dB");
+
+    var none = EqCurveFitter.FitBass(
+        CalibrationTargetKind.Flat, measurement, null, 0,
+        ceilingHz: 100, quick: false, compensationPercent: 0);
+    Check("S17 滑杆 0% 不生成低频补偿", none.Count <= 2, none.Count.ToString());
 }
 
 // ---- 结果 ----

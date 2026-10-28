@@ -21,7 +21,7 @@ public sealed class SettingsBackup
     };
 
     [JsonPropertyName("app")]
-    public string App { get; init; } = "PeaceWpf";
+    public string App { get; init; } = AppPaths.Name;
 
     [JsonPropertyName("version")]
     public string Version { get; init; } = string.Empty;

@@ -9,15 +9,22 @@ using PeaceWpf.Theme;
 
 namespace PeaceWpf.Controls;
 
-/// <summary>左键点在空白处：请求在对应频率新建一个点。视图收到 CreatedPointId 后直接进入拖动。</summary>
+/// <summary>
+/// 左键点在空白处：请求在落点新建一个点 —— 横向给频率，纵向给增益。
+/// 视图收到 CreatedPointId 后直接进入拖动。
+/// </summary>
 public sealed class PointCreateEventArgs : EventArgs
 {
-    public PointCreateEventArgs(double frequencyHz)
+    public PointCreateEventArgs(double frequencyHz, double gainDb)
     {
         FrequencyHz = frequencyHz;
+        GainDb = gainDb;
     }
 
     public double FrequencyHz { get; }
+
+    /// <summary>落点的增益，dB。已经扣掉预增益，可以直接当点的增益用。</summary>
+    public double GainDb { get; }
 
     /// <summary>由 ViewModel 填回新建点的 Id；-1 表示没建成（点太多或位置不合适）。</summary>
     public int CreatedPointId { get; set; } = -1;
@@ -110,8 +117,8 @@ public sealed class FlavorQualityEventArgs : EventArgs
 
 /// <summary>
 /// 自绘频响曲线。曲线本身就是编辑器：
-/// 左键空白建点并拖动、左键按住点拖动（左右改频率、上下改增益）、
-/// 滚轮改 Q、右键删点、悬停高亮并显示数值。
+/// 左键按住曲线抓频率最近的推子、空白处按下建点并拖动、左键按住点拖动（左右改频率、上下改增益）、
+/// 滚轮改 Q、右键删点（首尾端点右键归零）、悬停高亮并显示数值。
 ///
 /// 控件只负责“画”和“把鼠标意图翻译成事件”，夹取规则、撤回、脏标记都在 Core 里。
 /// 只读态（<see cref="IsEditable"/> 为假）不响应任何鼠标操作，曲线整体变暗。
@@ -203,7 +210,7 @@ public sealed class EqGraphView : FrameworkElement
         typeof(bool),
         typeof(EqGraphView),
         new FrameworkPropertyMetadata(false, FrameworkPropertyMetadataOptions.AffectsRender,
-            (d, _) => ((EqGraphView)d).AnimateTint(layerSwitch: false)));
+            (d, e) => ((EqGraphView)d).OnInteractiveChanged((bool)e.NewValue)));
 
     /// <summary>编辑的是低音层：正在编辑的曲线用紫色，左右用蓝色。</summary>
     public static readonly DependencyProperty BassEditingProperty = DependencyProperty.Register(
@@ -219,8 +226,50 @@ public sealed class EqGraphView : FrameworkElement
         set => SetValue(BassEditingProperty, value);
     }
 
+    /// <summary>
+    /// 「叠加低音修正」那个勾选。只影响进编辑那一刻的换形起点：
+    /// 没叠加时图上原本没有低音这条线，进低音编辑只能从 0 dB 平线长出来，
+    /// 不能把屏幕上的左右曲线揉成低音的。
+    /// </summary>
+    public static readonly DependencyProperty BassOverlayEnabledProperty = DependencyProperty.Register(
+        nameof(BassOverlayEnabled),
+        typeof(bool),
+        typeof(EqGraphView),
+        new FrameworkPropertyMetadata(true, FrameworkPropertyMetadataOptions.AffectsRender));
+
+    public bool BassOverlayEnabled
+    {
+        get => (bool)GetValue(BassOverlayEnabledProperty);
+        set => SetValue(BassOverlayEnabledProperty, value);
+    }
+
     private static readonly Color BassAccent = Color.FromRgb(0xA7, 0x8B, 0xFA);
     private static readonly Color WhiteAccent = Color.FromRgb(0xF2, 0xF5, 0xF8);
+
+    /// <summary>
+    /// 自带光标：悬停在能抓的地方是张开的手，按住时换成握住的手。
+    /// 系统光标里没有这两种，只能从资源里取；资源丢了就退回系统手形，不影响操作。
+    /// </summary>
+    private static Cursor? _openHand;
+    private static Cursor? _grabHand;
+
+    private static Cursor OpenHand => _openHand ??= LoadCursorAsset("cursor-open.cur");
+
+    private static Cursor GrabHand => _grabHand ??= LoadCursorAsset("cursor-grab.cur");
+
+    private static Cursor LoadCursorAsset(string fileName)
+    {
+        try
+        {
+            var info = Application.GetResourceStream(
+                new Uri($"pack://application:,,,/assets/{fileName}", UriKind.Absolute));
+            return info is null ? Cursors.Hand : new Cursor(info.Stream);
+        }
+        catch (Exception)
+        {
+            return Cursors.Hand;
+        }
+    }
 
     private double _tintBlend = 1;
     private Color _tintFrom = WhiteAccent;
@@ -232,6 +281,34 @@ public sealed class EqGraphView : FrameworkElement
     private double[] _curveFrom = Array.Empty<double>();
     private double _curveBlend = 1;
     private DispatcherTimer? _curveTimer;
+
+    /// <summary>
+    /// 进编辑那一刻屏幕上的旧曲线（只读态的采样）。下一帧换成这层的形状之前先记下它，
+    /// 让「合并 → 左右 / 合并 → 低音」是一次变形，而不是一次跳变。
+    /// </summary>
+    private double[]? _enterMorphFrom;
+    private bool _enterMorph;
+
+    /// <summary>退出编辑那一刻屏幕上的曲线；只读态第一帧拿它当起点长回合并曲线。</summary>
+    private double[]? _exitMorphFrom;
+
+    /// <summary>「按住曲线」的判定半径：按下点离画出来的曲线不超过这么多像素，就算抓在曲线上。</summary>
+    private const double CurvePickPixels = 8;
+    /// <summary>
+    /// 抓推子的横向范围：鼠标左右这么宽的一段频率里有推子才抓，一个都没有就在落点新建。
+    ///
+    /// 用倍频程而不是像素 —— 频率轴是 20 Hz–20 kHz 的一条对数轴，五分之一倍频程在任何窗口宽度下
+    /// 都只占轴的 2%，4K 的大窗口和 1080p 的小窗口手感一致；写死 32 px 会在大窗口里几乎抓不到、
+    /// 小窗口里又太黏。要调手感就改这一个数。
+    /// </summary>
+    private const double SnapOctaves = 0.2;
+
+    /// <summary>
+    /// 最近一次画出来的主曲线采样（dB）。命中判定直接查它，不必再算一遍频响；
+    /// 进编辑换形时也拿它当起点，接的是屏幕上真正看到的那条线。
+    /// </summary>
+    private double[]? _curveSamples;
+    private Rect _curveSamplesPlot;
 
     /// <summary>开关叠加低音这类整条曲线换形：按采样点插值，形状自己长过去。</summary>
     private void OnCurveTick(object? sender, EventArgs e)
@@ -276,6 +353,50 @@ public sealed class EqGraphView : FrameworkElement
         }
 
         _tintTimer.Start();
+    }
+
+    /// <summary>
+    /// 进编辑：先把上一帧画出来的曲线留一份，下一帧在 <see cref="DrawCurve"/> 里拿它做起点。
+    /// 起点用「画出来的」而不是「算出来的」，只读态自己正在形变时也不会接不上。
+    /// 退出同理：留的是刚编辑完的形状，而不是进编辑之前那条旧曲线。
+    /// </summary>
+    private void OnInteractiveChanged(bool interactive)
+    {
+        if (interactive && _curveSamples is { Length: > 1 } samples)
+        {
+            _enterMorphFrom = (double[])samples.Clone();
+            _enterMorph = true;
+            _exitMorphFrom = null;
+        }
+        else if (!interactive)
+        {
+            _enterMorphFrom = null;
+            _enterMorph = false;
+            _exitMorphFrom = _curveSamples is { Length: > 1 } last ? (double[])last.Clone() : null;
+        }
+
+        AnimateTint(layerSwitch: false);
+    }
+
+    /// <summary>让曲线从 <see cref="_curveFrom"/> 插到当前形状；16 ms 一帧，约 0.2 秒走完。</summary>
+    private void StartCurveMorph()
+    {
+        _curveTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _curveTimer.Tick -= OnCurveTick;
+        _curveTimer.Tick += OnCurveTick;
+        _curveTimer.Start();
+    }
+
+    /// <summary>换形期间人动手了：直接把曲线交给当前数据，不再让动画拖后腿。</summary>
+    private void EndCurveMorph()
+    {
+        _enterMorph = false;
+        _enterMorphFrom = null;
+        if (_curveBlend < 1)
+        {
+            _curveBlend = 1;
+            _curveTimer?.Stop();
+        }
     }
 
     private void OnTintTick(object? sender, EventArgs e)
@@ -349,6 +470,12 @@ public sealed class EqGraphView : FrameworkElement
     private int _dragId = -1;
     private int _hoverId = -1;
 
+    /// <summary>
+    /// 当前这次拖动是不是“抓住曲线”：是的话每次移动都要反推增益，让曲线经过鼠标，
+    /// 而不是把推子圆心直接摆在光标上。拖手柄不走这条，那时用户抓的是推子本身。
+    /// </summary>
+    private bool _dragThroughCurve;
+
     /// <summary>正在拖的风味下标；-1 表示没在拖。</summary>
     private int _flavorDragIndex = -1;
 
@@ -372,6 +499,11 @@ public sealed class EqGraphView : FrameworkElement
     public event EventHandler? PointMoveCommitted;
 
     public event EventHandler<PointEventArgs>? PointDeleteRequested;
+
+    /// <summary>
+    /// 右键首尾两个端点：它们删不掉，右键在它们身上只做“增益归零”这一件事。
+    /// </summary>
+    public event EventHandler<PointEventArgs>? PointResetRequested;
 
     public event EventHandler<PointQualityEventArgs>? QualityChanged;
 
@@ -542,6 +674,7 @@ public sealed class EqGraphView : FrameworkElement
         // 最后才是可拖的手柄。
         DrawReferenceCurve(dc, ReferencePoints);
         DrawFlavorCurve(dc);
+        DrawSweepCurves(dc);
         DrawCurve(dc, points);
         DrawHandles(dc, points);
         DrawFlavorHandles(dc);
@@ -554,6 +687,175 @@ public sealed class EqGraphView : FrameworkElement
         }
 
         DrawSweepCursor(dc);
+    }
+
+    // ---- 连续扫频实测：最多留 5 条，越新越亮 ----
+
+    /// <summary>主界面扫频测到的曲线，按时间先后排：最后一条最新。</summary>
+    private readonly List<IReadOnlyList<(double Hz, double Db)>> _sweepCurves = new();
+
+    /// <summary>中键合并出来的那条（多位置功率平均）。</summary>
+    private IReadOnlyList<(double Hz, double Db)>? _sweepAverage;
+
+    /// <summary>
+    /// 扫频曲线的平滑半径（点）。0 = 不平滑（默认）。
+    /// 用点数而不是倍频程：扫频时间一变、每倍频程点数就变，
+    /// 按点数算才能保证同一个档位的手感不变。
+    /// 只影响画出来的样子，数据本身不动：合并、判断驻波都按原始值算。
+    /// </summary>
+    public int SweepSmoothingPoints { get; set; }
+
+    // 几何缓存：尺寸、DPI、平滑档位、数据版本任一变化才重算。
+    // 拖窗口时每次 OnRender 都重算「平滑 + 分列」是白烧 CPU——20 秒档 3827 点、25 点半径、5 条线，
+    // 一帧就是几十万次乘加，拖动窗口会明显发涩。
+    private readonly List<Geometry?> _sweepGeometries = new();
+    private Geometry? _sweepAverageGeometry;
+    private (double W, double H, double Dpi, int Smooth, int Version) _sweepGeometryKey;
+    private bool _sweepGeometryReady;
+    private int _sweepVersion;
+
+    /// <summary>
+    /// 换一组实测曲线。<paramref name="average"/> 为 null 表示还没合并过。
+    /// </summary>
+    public void SetSweepCurves(
+        IReadOnlyList<IReadOnlyList<(double Hz, double Db)>> curves,
+        IReadOnlyList<(double Hz, double Db)>? average)
+    {
+        _sweepCurves.Clear();
+        _sweepCurves.AddRange(curves);
+        _sweepAverage = average;
+        _sweepVersion++;
+        _sweepGeometryReady = false;
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// 画绿色实测曲线。旧的压暗、新的提亮：一眼能看出「这条是上一次，那条是这一次」，
+    /// 而叠着看的时候又能看出哪一段是稳的、哪一段在动——驻波就是这么看出来的。
+    /// </summary>
+    private void DrawSweepCurves(DrawingContext dc)
+    {
+        if (_sweepCurves.Count == 0 && _sweepAverage is null)
+        {
+            return;
+        }
+
+        // 尺寸或 DPI 变了要重算：列是按物理像素分的，窗口一拉宽，每列包含的点就变了。
+        var dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
+        var key = (ActualWidth, ActualHeight, dpi, SweepSmoothingPoints, _sweepVersion);
+        if (!_sweepGeometryReady || !key.Equals(_sweepGeometryKey))
+        {
+            _sweepGeometries.Clear();
+            foreach (var curve in _sweepCurves)
+            {
+                _sweepGeometries.Add(curve.Count < 2 ? null : BuildCurve(Shape(curve)));
+            }
+
+            _sweepAverageGeometry = _sweepAverage is { Count: > 1 } average ? BuildCurve(Shape(average)) : null;
+            _sweepGeometryKey = key;
+            _sweepGeometryReady = true;
+        }
+
+        var count = _sweepGeometries.Count;
+        for (var i = 0; i < count; i++)
+        {
+            if (_sweepGeometries[i] is not { } geometry)
+            {
+                continue;
+            }
+
+            // 最旧一档压到 0.22，最新一档 1.0。
+            var t = count == 1 ? 1.0 : i / (double)(count - 1);
+            var alpha = (byte)Math.Round((0.22 + 0.78 * t) * 255);
+            dc.DrawGeometry(null, new Pen(SweepBrush(alpha), 1.2), geometry);
+        }
+
+        if (_sweepAverageGeometry is { } merged)
+        {
+            // 合并那条用更亮更粗的绿：它就是「几个位置都还在」的东西。
+            dc.DrawGeometry(null, new Pen(SweepBrush(255, bright: true), 2.0), merged);
+        }
+    }
+
+    /// <summary>按当前平滑档位处理一下再画；关档原样返回，数据不动。</summary>
+    private IReadOnlyList<(double Hz, double Db)> Shape(IReadOnlyList<(double Hz, double Db)> curve) =>
+        SweepSmoothingPoints > 0
+            ? PeaceWpf.Core.Audio.ChirpSweepAnalyzer.SmoothByPoints(curve, SweepSmoothingPoints)
+            : curve;
+
+    private static Brush SweepBrush(byte alpha, bool bright = false)
+    {
+        var brush = new SolidColorBrush(Color.FromArgb(
+            alpha,
+            bright ? (byte)0xB4 : (byte)0x5A,
+            bright ? (byte)0xFF : (byte)0xD6,
+            bright ? (byte)0xC8 : (byte)0x7A));
+        brush.Freeze();
+        return brush;
+    }
+
+    private StreamGeometry BuildCurve(IReadOnlyList<(double Hz, double Db)> curve)
+    {
+        // 每列**物理像素**里的点合并成一个（取中位数）。一条扫频曲线有两三千个点、画布只有几百 px，
+        // 每列挤着好几个点，逐点连出来就是一根竖着抖的毛线。
+        //
+        // 按设备像素而不是 DIP 分列：150% 缩放下一个 DIP 是 1.5 个设备像素，
+        // 按 DIP 分会把三分之一的分辨率白白丢掉，看起来就是「列很粗」。
+        //
+        // 这里只改显示、不改数据：峰和坑还在原来那一列，只是同列的点不再互相拉扯。
+        var scale = VisualTreeHelper.GetDpi(this).DpiScaleX;
+        if (scale <= 0)
+        {
+            scale = 1;
+        }
+
+        var buckets = new Dictionary<int, List<double>>();
+        var columns = new List<int>();
+
+        foreach (var (hz, db) in curve)
+        {
+            var x = (int)Math.Round(FreqToX(hz) * scale);
+            if (!buckets.TryGetValue(x, out var values))
+            {
+                values = new List<double>(4);
+                buckets[x] = values;
+                columns.Add(x);
+            }
+
+            values.Add(db);
+        }
+
+        columns.Sort();
+
+        var geometry = new StreamGeometry();
+        if (columns.Count == 0)
+        {
+            geometry.Freeze();
+            return geometry;
+        }
+
+        using (var ctx = geometry.Open())
+        {
+            var first = columns[0];
+            ctx.BeginFigure(new Point(first / scale, DbToY(MedianOf(buckets[first]))), false, false);
+            for (var i = 1; i < columns.Count; i++)
+            {
+                var x = columns[i];
+                ctx.LineTo(new Point(x / scale, DbToY(MedianOf(buckets[x]))), true, false);
+            }
+        }
+
+        geometry.Freeze();
+        return geometry;
+    }
+
+    private static double MedianOf(List<double> values)
+    {
+        values.Sort();
+        var middle = values.Count / 2;
+        return values.Count % 2 == 1
+            ? values[middle]
+            : (values[middle - 1] + values[middle]) / 2;
     }
 
     /// <summary>
@@ -710,20 +1012,38 @@ public sealed class EqGraphView : FrameworkElement
             return;
         }
 
-        // 只读态下曲线换了形状（比如勾/取消「叠加低音修正」）：从上一份采样插值过去。
-        var draw = values;
-        if (!FlavorHandlesInteractive
-            && _curveTarget is { } previous
-            && previous.Length == values.Length
-            && _curveBlend >= 1
-            && !SameSamples(previous, values))
+        // 进编辑那一刻：先把只读态画着的曲线留住当起点，这一帧开始长成这层自己的形状。
+        // 没叠低音时进低音编辑，图上原本没有这条线 —— 起点是 0 dB 平线，不是把左右曲线揉过去。
+        if (_enterMorph && FlavorHandlesInteractive)
         {
-            _curveFrom = previous;
-            _curveBlend = 0;
-            _curveTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-            _curveTimer.Tick -= OnCurveTick;
-            _curveTimer.Tick += OnCurveTick;
-            _curveTimer.Start();
+            _enterMorph = false;
+            var from = BassEditing && !BassOverlayEnabled ? new double[values.Length] : _enterMorphFrom;
+            if (from is not null && from.Length == values.Length)
+            {
+                _curveFrom = from;
+                _curveBlend = 0;
+                StartCurveMorph();
+            }
+
+            _enterMorphFrom = null;
+        }
+
+        // 只读态下曲线换了形状（退出编辑、勾/取消「叠加低音修正」）：从上一份采样插值过去。
+        // 退出编辑的起点优先用刚编辑完的那条；之后各帧仍旧和 _curveTarget 比。
+        var draw = values;
+        if (!FlavorHandlesInteractive)
+        {
+            var previous = _exitMorphFrom ?? _curveTarget;
+            _exitMorphFrom = null;
+            if (previous is { } prev
+                && prev.Length == values.Length
+                && _curveBlend >= 1
+                && !SameSamples(prev, values))
+            {
+                _curveFrom = prev;
+                _curveBlend = 0;
+                StartCurveMorph();
+            }
         }
 
         if (_curveBlend < 1 && _curveFrom.Length == values.Length)
@@ -739,6 +1059,10 @@ public sealed class EqGraphView : FrameworkElement
         {
             _curveTarget = values;
         }
+
+        // 屏幕上画的是 draw，留一份给「按住曲线」的命中判定，省得每次鼠标移动重算频响。
+        _curveSamples = draw;
+        _curveSamplesPlot = _plot;
 
         var geometry = new StreamGeometry();
         using (var ctx = geometry.Open())
@@ -1007,6 +1331,9 @@ public sealed class EqGraphView : FrameworkElement
             return;
         }
 
+        // 一落手就是跟手编辑：进场动画到此收尾，别让 0.2 秒的插值吃掉操作手感。
+        EndCurveMorph();
+
         var position = e.GetPosition(this);
         if (!_plot.Contains(position))
         {
@@ -1031,19 +1358,48 @@ public sealed class EqGraphView : FrameworkElement
         {
             _dragId = hit.Id;
             _hoverId = hit.Id;
+            _dragThroughCurve = false;
+            Cursor = GrabHand;
             CaptureMouse();
             InvalidateVisual();
             e.Handled = true;
             return;
         }
 
-        // 空白处：请求建点，建成了就直接接管拖动，做到“点一下就跟着走”。
-        var args = new PointCreateEventArgs(XToFreq(position.X));
+        var frequency = XToFreq(position.X);
+        var gainDb = YToDb(position.Y) - PreAmpDb;
+
+        // 压在曲线上就当成“抓住曲线”：最近的那颗推子跟手走。
+        // 抓取距离是频率轴的一段比例（见 SnapOctaves），跟窗口宽度无关。
+        var grabbed = CurvePick(position, frequency);
+        if (grabbed >= 0)
+        {
+            _dragId = grabbed;
+            _hoverId = grabbed;
+            _dragThroughCurve = true;
+            Cursor = GrabHand;
+            CaptureMouse();
+            InvalidateVisual();
+            e.Handled = true;
+            return;
+        }
+
+        // 曲线上没有可抓的推子，或者压根没按在曲线上：在落点新建一个，建成就直接接管拖动。
+        // 按在曲线上建点时也反推一次：新点一出生就压在鼠标上，而不是把曲线顶高一截。
+        var onCurve = IsNearCurve(position);
+        if (onCurve && Points is { } existing)
+        {
+            gainDb = EqResponse.GainForNewPointAt(existing, frequency, gainDb);
+        }
+
+        var args = new PointCreateEventArgs(frequency, gainDb);
         CreatePointRequested?.Invoke(this, args);
         if (args.CreatedPointId >= 0)
         {
             _dragId = args.CreatedPointId;
             _hoverId = args.CreatedPointId;
+            _dragThroughCurve = onCurve;
+            Cursor = GrabHand;
             CaptureMouse();
         }
 
@@ -1071,7 +1427,17 @@ public sealed class EqGraphView : FrameworkElement
         if (_dragId >= 0)
         {
             // 手柄画在「增益 + 预增益」的位置上，拖回来时要扣掉预增益，点才跟手。
-            PointMovePreview?.Invoke(this, new PointMoveEventArgs(_dragId, XToFreq(position.X), YToDb(position.Y) - PreAmpDb));
+            var frequency = XToFreq(position.X);
+            var gainDb = YToDb(position.Y) - PreAmpDb;
+
+            // 抓住曲线拖：曲线要经过鼠标，所以增益从曲线反推，不是照抄鼠标高度。
+            // 别的推子在这一点的贡献要先扣掉，否则曲线会跟鼠标差那么一点。
+            if (_dragThroughCurve && Points is { } points)
+            {
+                gainDb = EqResponse.GainForCurveThrough(points, _dragId, frequency, gainDb);
+            }
+
+            PointMovePreview?.Invoke(this, new PointMoveEventArgs(_dragId, frequency, gainDb));
             InvalidateVisual();
             e.Handled = true;
             return;
@@ -1081,6 +1447,10 @@ public sealed class EqGraphView : FrameworkElement
         var flavorHover = inPlot ? HitTestFlavor(position, 14) : -1;
         var hover = flavorHover >= 0 || !inPlot ? null : HitTest(position, 14);
         var hoverId = hover?.Id ?? -1;
+
+        // 光标就是操作说明：压在手柄或曲线上都是“抓”，按下去就能拖；
+        // 空白处是十字，按下去是建点。曲线上不要求附近有推子 —— 没有就是新建，同样是“按在线上拖”。
+        var onCurve = hoverId < 0 && inPlot && IsNearCurve(position);
         if (flavorHover != _flavorHoverIndex || hoverId != _hoverId)
         {
             _flavorHoverIndex = flavorHover;
@@ -1092,8 +1462,8 @@ public sealed class EqGraphView : FrameworkElement
             ? Cursors.Arrow
             : flavorHover >= 0
                 ? Cursors.SizeWE
-                : hoverId >= 0
-                    ? Cursors.Hand
+                : hoverId >= 0 || onCurve
+                    ? OpenHand
                     : (_plot.Contains(position) ? Cursors.Cross : Cursors.Arrow);
     }
 
@@ -1118,7 +1488,11 @@ public sealed class EqGraphView : FrameworkElement
         }
 
         _dragId = -1;
+        _dragThroughCurve = false;
         ReleaseMouseCapture();
+
+        // 松手后鼠标还在原地：手底下是曲线就还原成张开的手（还能再抓），否则回到十字（可以建点）。
+        Cursor = IsNearCurve(e.GetPosition(this)) ? OpenHand : Cursors.Cross;
         PointMoveCommitted?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
         e.Handled = true;
@@ -1143,11 +1517,22 @@ public sealed class EqGraphView : FrameworkElement
         }
 
         var hit = HitTest(e.GetPosition(this), 13);
-        if (hit is { IsDeletable: true })
+        if (hit is null)
+        {
+            return;
+        }
+
+        // 首尾端点是频轴的地基，删不掉；右键在它们身上改成“增益归零”。
+        if (hit.IsDeletable)
         {
             PointDeleteRequested?.Invoke(this, new PointEventArgs(hit.Id));
-            e.Handled = true;
         }
+        else
+        {
+            PointResetRequested?.Invoke(this, new PointEventArgs(hit.Id));
+        }
+
+        e.Handled = true;
     }
 
     protected override void OnMouseWheel(MouseWheelEventArgs e)
@@ -1218,6 +1603,47 @@ public sealed class EqGraphView : FrameworkElement
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// 按下点算不算抓住了某颗推子。两件事一起判：纵向贴着画出来的那条曲线，
+    /// 横向在鼠标左右 <see cref="SnapOctaves"/> 个倍频程内有推子。返回 -1 表示没抓住，调用方就在落点新建一个。
+    /// </summary>
+    private int CurvePick(Point position, double frequencyHz)
+    {
+        if (!IsNearCurve(position) || Points is not { } points)
+        {
+            return -1;
+        }
+
+        return points.NearestWithin(frequencyHz, SnapOctaves)?.Id ?? -1;
+    }
+
+    /// <summary>
+    /// 鼠标离画出来的曲线是否在一指之内。查的是最近一次绘制的采样，不重算频响，
+    /// 所以悬停判定和屏幕上看到的形状永远是同一条线。
+    /// </summary>
+    private bool IsNearCurve(Point position)
+    {
+        if (_curveSamples is not { Length: > 1 } samples || _curveSamplesPlot.Width <= 0)
+        {
+            return false;
+        }
+
+        var t = (position.X - _curveSamplesPlot.Left) / _curveSamplesPlot.Width;
+        if (t < 0 || t > 1)
+        {
+            return false;
+        }
+
+        var index = t * (samples.Length - 1);
+        var left = (int)Math.Floor(index);
+        var fraction = index - left;
+        var db = left + 1 < samples.Length
+            ? samples[left] + (samples[left + 1] - samples[left]) * fraction
+            : samples[left];
+
+        return Math.Abs(position.Y - DbToY(db + PreAmpDb)) <= CurvePickPixels;
     }
 
     // 预增益会把整条曲线往下压，范围只取 GainRange 的话曲线会贴下边界被切掉。

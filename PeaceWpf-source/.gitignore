@@ -17,9 +17,15 @@
 # 安装包（55 MB，属于可再下载的发布物）
 PeaceSetup.exe
 
+# publish.cmd 的产物：自包含目录 + EasyEQ-Setup.exe
+dist/
+
 # 系统文件
 Thumbs.db
 Desktop.ini
 
 # 参考用的独立仓库，不跟本项目一起提交
 EasyEQ/
+
+# 扫频录音（每次重测都会重生成，单个 9 MB；只备份 CSV 读数）
+attic/*.wav

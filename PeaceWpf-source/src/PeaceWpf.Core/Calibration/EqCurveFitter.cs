@@ -48,7 +48,8 @@ public sealed class CalibrationPlan
         double targetOffsetDb,
         IReadOnlyList<double> residualDb,
         double rippleDb,
-        double floorHz = EqCurveFitter.CalibrationFloorHz)
+        double floorHz = EqCurveFitter.CalibrationFloorHz,
+        IReadOnlyList<double>? clipDb = null)
     {
         Target = target;
         Measured = measured;
@@ -60,10 +61,18 @@ public sealed class CalibrationPlan
         ResidualDb = residualDb;
         RippleDb = rippleDb;
         FloorHz = floorHz;
+        ClipDb = clipDb ?? Array.Empty<double>();
     }
 
     /// <summary>校准到哪条曲线。</summary>
     public CalibrationTargetKind Target { get; }
+
+    /// <summary>
+    /// 手改曲线之后按新点重建一份：目标、测量、残差都沿用，只换点和预增益。
+    /// 给主界面拖动回传用。
+    /// </summary>
+    public CalibrationPlan WithPoints(EqPointList points, double preAmpDb) =>
+        new(Target, Measured, TargetDb, CorrectionDb, points, preAmpDb, TargetOffsetDb, ResidualDb, RippleDb, FloorHz, ClipDb);
 
     /// <summary>这次拟合用的矫正起点（Hz）：这以上由本层拟合，以下交给低音层。</summary>
     public double FloorHz { get; }
@@ -103,6 +112,43 @@ public sealed class CalibrationPlan
         ResidualDb.Count == 0 ? 0 : ResidualDb.Max(value => Math.Abs(value));
 
     /// <summary>
+    /// 每个测量频点上「实际输出超过 0 dBFS」的量（dB），矫正起点以下记 0。
+    /// 这是补偿之后真正会被削掉的部分，图上用它把曲线染红。
+    /// </summary>
+    public IReadOnlyList<double> ClipDb { get; }
+
+    /// <summary>被削掉最多的那个频点有多少 dB。</summary>
+    public double MaxClipDb => ClipDb.Count == 0 ? 0 : ClipDb.Max();
+
+    /// <summary>
+    /// 矫正起点以上、被削掉的频点占多少（0–1）。
+    /// 只给颜色和诊断用，界面上不显示文字。
+    /// </summary>
+    public double ClippedFraction
+    {
+        get
+        {
+            var total = 0;
+            var clipped = 0;
+            for (var i = 0; i < ClipDb.Count && i < Measured.Count; i++)
+            {
+                if (Measured[i].FrequencyHz < FloorHz)
+                {
+                    continue;
+                }
+
+                total++;
+                if (ClipDb[i] > 0.05)
+                {
+                    clipped++;
+                }
+            }
+
+            return total == 0 ? 0 : (double)clipped / total;
+        }
+    }
+
+    /// <summary>
     /// EQ 实际响应在 1/24 倍频程上的最大相邻落差（dB）。
     ///
     /// 这是「曲线会不会被 Q 弄成锯齿」的量化。测量只在 61 个频点上有数据，
@@ -125,6 +171,35 @@ public sealed class CalibrationPlan
             }
 
             return (CorrectionDb.Min(), CorrectionDb.Max());
+        }
+    }
+
+    /// <summary>
+    /// 这套 EQ 在 500 Hz–2 kHz 的中位净变化（dB），已经叠加预增益。
+    ///
+    /// 这是「套用后听歌时音量会小多少」最接近的一个数。不能只用预增益：
+    /// 一条全削减的曲线预增益是 0，整体却实实在在变小了；也不能把「预增益 + 目标下移」
+    /// 直接相加，目标下移已经含在曲线形状里，再相加就算了两遍。
+    /// 取中位数而不是 1 kHz 单点，是为了避开正好落在窄坑或窄峰上的情况。低频层不参与。
+    /// </summary>
+    public double OverallGainDb
+    {
+        get
+        {
+            var snapshot = Points.ToSnapshot();
+            var values = new List<double>();
+            for (var hz = 500.0; hz <= 2000; hz *= Math.Pow(2, 1.0 / 6))
+            {
+                values.Add(EqResponse.GainAt(snapshot, hz));
+            }
+
+            if (values.Count == 0)
+            {
+                return PreAmpDb;
+            }
+
+            values.Sort();
+            return values[values.Count / 2] + PreAmpDb;
         }
     }
 
@@ -584,13 +659,15 @@ public static class EqCurveFitter
         bool movableBands = false,
         double floorHz = CalibrationFloorHz,
         bool quick = false,
-        bool aggressive = false)
+        bool aggressive = false,
+        double maxBoostDb = MaxBoostDb,
+        double compensationPercent = 0)
     {
         ArgumentNullException.ThrowIfNull(measurement);
 
         // 激进轮：放宽限幅、跳过窄坑保护、减少平滑。
         // 不放松这三道闸，desired 算得再深也会被解回常规那套，用户看到的就是「曲线没变」。
-        var maxBoost = aggressive ? MaxBoostDb * 1.7 : MaxBoostDb;
+        var maxBoost = aggressive ? maxBoostDb * 1.7 : maxBoostDb;
         var maxCut = aggressive ? MaxCutDb * 1.5 : MaxCutDb;
         var smoothing = aggressive ? CorrectionSmoothingOctaves * 0.5 : CorrectionSmoothingOctaves;
 
@@ -605,7 +682,7 @@ public static class EqCurveFitter
         }
 
         var frequencies = measurement.Frequencies;
-        var levels = FillGaps(measurement);
+        var levels = FillGaps(measurement, floorHz);
         if (levels is null)
         {
             throw new ArgumentException("这次测量没有一个点可用：声音太轻，或者麦克风没录到东西。", nameof(measurement));
@@ -624,7 +701,7 @@ public static class EqCurveFitter
         }
 
         var baseTarget = TargetCurve.Sample(target, frequencies);
-        var offset = targetOffsetDb ?? AutoTargetOffset(baseTarget, levels, frequencies, floorHz);
+        var offset = targetOffsetDb ?? AutoTargetOffset(baseTarget, levels, frequencies, floorHz, maxBoost);
 
         var targetDb = new double[baseTarget.Length];
         for (var i = 0; i < baseTarget.Length; i++)
@@ -661,6 +738,28 @@ public static class EqCurveFitter
         {
             correction = LimitNarrowBoosts(correction, notchWidths, rawCorrection);
         }
+
+        // 补偿档：前一半先把被预增益压掉的整体音量补回来，后一半放开允许提升、
+        // 峰值超出 0 dBFS 的部分就是用户主动接受的削波。
+        var curvePeak = 0.0;
+        for (var i = 0; i < correction.Length; i++)
+        {
+            if (frequencies[i] >= floorHz)
+            {
+                curvePeak = Math.Max(curvePeak, correction[i]);
+            }
+        }
+
+        var (curveLimit, _, _) = MapCompensation(curvePeak, compensationPercent);
+
+        // 曲线本身不能超过这条线：截掉的部分就是「不强行提升」。
+        for (var i = 0; i < correction.Length; i++)
+        {
+            correction[i] = Math.Min(correction[i], curveLimit);
+        }
+
+        // 拟合时的限幅也跟着收，否则解出来的点还会顶回去。
+        var effectiveBoost = Math.Min(maxBoost, curveLimit);
 
         var gridFrequencies = BuildFrequencies(density, floorHz);
         var baseQualities = LocalQualities(gridFrequencies);
@@ -709,7 +808,7 @@ public static class EqCurveFitter
                 // 点本身可以不要，这一轮只是在挑「哪套摆法 + 哪个 Q」打分最好。
                 var (_, _, score) = Evaluate(
                     fitTarget, fitFrequencies, qualities, targetDb, levels, frequencies, baselineGains,
-                    bounds, maxBoost, maxCut);
+                    bounds, effectiveBoost, maxCut);
 
                 if (!found || score < bestScore)
                 {
@@ -731,7 +830,7 @@ public static class EqCurveFitter
             // 实时预览：解出来就直接用，不做逐段放宽。完整搜索留给测完那一次。
             var evaluated = Evaluate(
                 bestTarget, bestFitFrequencies, bestQualities, targetDb, levels, frequencies, baselineGains,
-                bounds, maxBoost, maxCut);
+                bounds, effectiveBoost, maxCut);
             points = evaluated.Points;
             ripple = evaluated.Ripple;
         }
@@ -739,12 +838,12 @@ public static class EqCurveFitter
         {
             var relaxed = RelaxQuality(
                 bestTarget, bestFitFrequencies, bestQualities, targetDb, levels, frequencies, baselineGains,
-                bounds, floorHz, null, maxBoost, maxCut);
+                bounds, floorHz, null, effectiveBoost, maxCut);
             points = relaxed.Points;
             ripple = relaxed.Ripple;
         }
 
-        var preAmp = ComputePreAmp(points, floorHz);
+        var preAmp = ComputeCompensatedPreAmp(points, floorHz, compensationPercent, curveLimit);
         var residual = ComputeResidual(points, targetDb, levels, frequencies, baselineGains, bounds);
 
         // 残差驱动局部加密：格点之间漏掉的窄谷/窄峰，在残差大的地方补段再解一次。
@@ -783,7 +882,7 @@ public static class EqCurveFitter
                     var candidate = QualityPerPoint(denseTarget, denseBase, scale, maxWiden);
                     var (_, _, score) = Evaluate(
                         denseTarget, denseGrid, candidate, targetDb, levels, frequencies, baselineGains,
-                        bounds, maxBoost, maxCut);
+                        bounds, effectiveBoost, maxCut);
 
                     if (denseQualities is null || score < denseScore)
                     {
@@ -796,18 +895,20 @@ public static class EqCurveFitter
                 {
                     var denseRelaxed = RelaxQuality(
                         denseTarget, denseGrid, denseQualities, targetDb, levels, frequencies, baselineGains,
-                        bounds, floorHz, null, maxBoost, maxCut);
+                        bounds, floorHz, null, effectiveBoost, maxCut);
 
                     points = denseRelaxed.Points;
                     ripple = denseRelaxed.Ripple;
-                    preAmp = ComputePreAmp(points, floorHz);
+                    preAmp = ComputeCompensatedPreAmp(points, floorHz, compensationPercent, curveLimit);
                     residual = ComputeResidual(points, targetDb, levels, frequencies, baselineGains, bounds);
                 }
             }
         }
 
+        var clip = ComputeClip(points, measurement.Points, preAmp, floorHz);
+
         return new CalibrationPlan(
-            target, measurement.Points, targetDb, correction, points, preAmp, offset, residual, ripple, floorHz);
+            target, measurement.Points, targetDb, correction, points, preAmp, offset, residual, ripple, floorHz, clip);
     }
 
     /// <summary>
@@ -837,7 +938,9 @@ public static class EqCurveFitter
         double maxStepDb = 6,
         double floorHz = CalibrationFloorHz,
         bool quick = false,
-        bool aggressive = false)
+        bool aggressive = false,
+        double maxBoostDb = MaxBoostDb,
+        double compensationPercent = 0)
     {
         ArgumentNullException.ThrowIfNull(appliedPlan);
         ArgumentNullException.ThrowIfNull(measurement);
@@ -896,7 +999,7 @@ public static class EqCurveFitter
         // 目标偏移固定 0：这条曲线本身就可能起伏十几 dB，自动压低目标会把整条压扁。
         var fitted = Fit(
             target, synthetic, 0, density, null, movableBands: !quick, floorHz: floorHz, quick: quick,
-            aggressive: aggressive);
+            aggressive: aggressive, maxBoostDb: maxBoostDb, compensationPercent: compensationPercent);
 
         // 拟合用的是「目标 − 期望曲线」这条合成数据，但界面上那条灰线必须是**真测到的**。
         // 拿合成数据当 Measured，灰线画出来就是新 EQ 的反相（一个 +13 dB 的鼓包），
@@ -931,7 +1034,8 @@ public static class EqCurveFitter
             fitted.TargetOffsetDb,
             residual,
             fitted.RippleDb,
-            fitted.FloorHz);
+            fitted.FloorHz,
+            fitted.ClipDb);
     }
 
     // ---- 低频矫正：单独写给「低音」层 ----
@@ -961,17 +1065,71 @@ public static class EqCurveFitter
     /// <summary>从这一频率开始往 0 dB 淡出，到 <see cref="BassCeilingHz"/> 正好回零，不和主层推子叠。</summary>
     public const double BassFadeStartHz = 80;
 
-    /// <summary>低频推子的段距：三分之一倍频程。20–100 Hz 大约 8 个点。</summary>
-    public const double BassStepOctaves = 1.0 / 3.0;
+    /// <summary>
+    /// 低频推子的段距：半个倍频程。20–100 Hz 大约 5 个点。
+    ///
+    /// 原来用三分之一倍频程，段距和驻波宽度差不多：每段都在追一个独立的峰谷，
+    /// 相邻段经常一正一负，曲线就弯成蛇形。半倍频程只表达低频的「大形状」，
+    /// 具体驻波交给房间摆位处理。
+    /// </summary>
+    public const double BassStepOctaves = 1.0 / 2.0;
 
-    /// <summary>低频修正量的平滑宽度。比主层的 1/3 窄一点：低频段本来就长，抹太宽会把房间模式一起抹平。</summary>
-    public const double BassSmoothingOctaves = 1.0 / 6.0;
+    /// <summary>
+    /// 低频修正量的平滑宽度。
+    ///
+    /// 比主层宽：低频优先「整体平滑」，不去追单个驻波峰谷。20–100 Hz 的房间模式常在
+    /// 半倍频程内峰谷交替十几 dB，1/3 倍频程的推子本来就补不动它们；硬追只会解出
+    /// +18 / −13 交替的推子，曲线连着弯好几折（蛇形），还吃掉十几 dB 预增益。
+    /// 半倍频程只保留整体下潜和趋势，剩下的交给摆位和耳机本身。
+    /// </summary>
+    public const double BassSmoothingOctaves = 1.0;
 
     /// <summary>低频最多往上提多少 dB。比主层的 +9 宽：低音炮/大单元的下潜补偿需要更多余量。</summary>
     public const double BassMaxBoostDb = 18;
 
     /// <summary>低频最多往下压多少 dB。</summary>
     public const double BassMaxCutDb = 18;
+
+    /// <summary>
+    /// 低频窄谷判据：半高宽小于四分之一倍频程就算「驻波谷」。
+    ///
+    /// 主层那条针尖判据是 1/12 倍频程，挡不住低频：20–100 Hz 的房间模式/驻波谷典型宽度
+    /// 就是 1/6–1/4 倍频程。这种谷用 1/3 倍频程的推子去抬，两侧必须同时削才抵得平，
+    /// 解出来就是 +18 / −13 交替、曲线连着弯好几折的蛇形，还要吃掉十几 dB 预增益。
+    /// </summary>
+    private const double BassNotchOctaves = 1.0 / 4.0;
+
+    /// <summary>低频窄谷判据：深度超过这个值才放弃（浅谷补起来代价小，留着）。</summary>
+    private const double BassNotchDepthDb = 8.0;
+
+    /// <summary>
+    /// 低频可信点少于这个数，就判定「这一段没测到」，不再拿外推出来的平线去反相，
+    /// 改用 <see cref="BuildFallbackBass"/> 按补偿滑杆生成一条平滑低频补偿。
+    /// </summary>
+    public const int BassFallbackMinPoints = 4;
+
+    /// <summary>
+    /// 兜底低频补偿的倍数：滑杆允许的主层提升（<see cref="MaxBoostDb"/>，9 dB）乘 3，
+    /// 封顶 <see cref="BassMaxBoostDb"/>。低频要的推动量本来就比中高频大。
+    /// </summary>
+    private const double BassFallbackBoostFactor = 3;
+
+    /// <summary>
+    /// 低频点采信的信噪比门槛。主层只要 6 dB 就算可用，低频比它高 4 dB。
+    ///
+    /// 20–100 Hz 的单频探测本来就被宽带噪声压着：信噪比 6 dB 时，读数的一半功率是噪声，
+    /// 电平会跟着噪声底漂。低频又正好是「差几 dB 就听得出」的频段，宁可少采几个点、
+    /// 让它们按邻点插值，也不要把噪声当设备响应拟合进去。
+    /// </summary>
+    public const double BassMinimumSnrDb = 10;
+
+    /// <summary>
+    /// 低频孤立点的邻域半径（测量点个数）。左右紧邻的点都不可信时，这个点就算孤立。
+    ///
+    /// 只认紧邻：低频网格是 1/6 倍频程一个点，隔一个噪声点再遇到可信点，
+    /// 说明这一带本来就测不稳，中间那个读数更可能是噪声碰巧冒高。
+    /// </summary>
+    private const int BassIsolatedNeighbourhood = 1;
 
     /// <summary>
     /// 残差与平坦度的统计范围。
@@ -986,7 +1144,7 @@ public static class EqCurveFitter
     }
 
     /// <summary>
-    /// 低频推子的中心频率：22.4 Hz 起，每 1/3 倍频程一个，最后补一个 <paramref name="ceilingHz"/> 的锚点。
+    /// 低频推子的中心频率：22.4 Hz 起，每半个倍频程一个，最后补一个 <paramref name="ceilingHz"/> 的锚点。
     ///
     /// 锚点那一点的修正量会被淡出权重压成 0，它只负责让曲线在交界处收住，
     /// 不参与合并（0 dB 点不会成为 <see cref="EqLayerSet.BassContributors"/>）。
@@ -1037,7 +1195,8 @@ public static class EqCurveFitter
         EqPointList? baselineEq = null,
         double targetOffsetDb = 0,
         double ceilingHz = BassCeilingHz,
-        bool quick = false)
+        bool quick = false,
+        double compensationPercent = 0)
     {
         ArgumentNullException.ThrowIfNull(measurement);
 
@@ -1049,8 +1208,17 @@ public static class EqCurveFitter
             throw new ArgumentException("测量结果是空的。", nameof(measurement));
         }
 
+        // 低频这一段没有可信数据（或者少到反相只会被外推出来的平线支配）：不再硬反相。
+        // 整条测量也都没数据时才继续往下走、按原来的「一个点都没有」报错。
+        var trustedLow = TrustedLowMask(measurement.Points, ceilingHz).
+            Count(ok => ok);
+        if (trustedLow < BassFallbackMinPoints && measurement.UsableCount >= BassFallbackMinPoints)
+        {
+            return BuildFallbackBass(ceilingHz, compensationPercent);
+        }
+
         var frequencies = measurement.Frequencies;
-        var levels = FillGaps(measurement);
+        var levels = FillGaps(measurement, ceilingHz);
         if (levels is null)
         {
             throw new ArgumentException("这次测量没有一个点可用：声音太轻，或者麦克风没录到东西。", nameof(measurement));
@@ -1104,8 +1272,10 @@ public static class EqCurveFitter
         }
 
         // 顺序和主层一样：先淡出（不然低频的大补偿会顺着平滑窗口渗到分界线以上），
-        // 再平滑，再淡出一次，最后限幅。
+        // 再平滑，再淡出一次，最后限幅 + 窄谷保护。
         correction = ApplyBassFade(correction, lowFrequencies, ceilingHz);
+        var rawBassCorrection = (double[])correction.Clone();
+        var bassNotchWidths = NotchWidths(rawBassCorrection, lowFrequencies);
         correction = Smooth(correction, lowFrequencies, BassSmoothingOctaves);
         correction = ApplyBassFade(correction, lowFrequencies, ceilingHz);
 
@@ -1113,6 +1283,12 @@ public static class EqCurveFitter
         {
             correction[i] = Math.Clamp(correction[i], -BassMaxCutDb, BassMaxBoostDb);
         }
+
+        // 窄而深的驻波谷整个放弃，只削峰。判据比主层宽：低频那段本来就是一米级波长的事，
+        // 1/4 倍频程宽的谷在听觉上是房间，不属于「矫正」能补回来的部分。
+        correction = LimitNarrowBoosts(
+            correction, bassNotchWidths, rawBassCorrection,
+            narrowOctaves: BassNotchOctaves, narrowDepthDb: BassNotchDepthDb);
 
         // 残差/平坦度用的目标：correction 加上当时的实测，再减掉已套用的主层。
         // 这样 MaxResidualOf 里的「target − 裸实测 − EQ」正好化简成「correction − EQ」。
@@ -1178,6 +1354,51 @@ public static class EqCurveFitter
         var kept = fitted.Points
             .Where(point => point.IsEndpoint
                 || (Math.Abs(point.GainDb) >= 0.05 && point.FrequencyHz > BassFloorHz + 1))
+            .ToList();
+
+        return EqPointList.FromPoints(kept);
+    }
+
+    /// <summary>
+    /// 测不到低频时的低频补偿：按补偿滑杆生成一条平滑的低频提升曲线。
+    ///
+    /// 以前低频没有可信点时，FillGaps 会把整段外推成「平」的（反相后就是 0 dB），
+    /// 低音层交上去什么都没做；噪声里偶尔冒一两个点，反相还会得到一个假峰。
+    /// 现在改成确定的形状：0 增益点在矫正起点右侧 1/6 倍频程（正好是主层第一个推子的位置），
+    /// 往低频按 smoothstep 平滑升到滑杆允许的提升，20 Hz 附近接近满值。
+    ///
+    /// 提升量 = 滑杆百分比 × 主层允许提升（9 dB）× <see cref="BassFallbackBoostFactor"/>，
+    /// 封顶 <see cref="BassMaxBoostDb"/>。滑杆 0% 时返回空（不写低音层）。
+    /// </summary>
+    private static EqPointList BuildFallbackBass(double ceilingHz, double compensationPercent)
+    {
+        var maxGain = Math.Clamp(
+            Math.Clamp(compensationPercent, 0, 100) / 100.0 * MaxBoostDb * BassFallbackBoostFactor,
+            0,
+            BassMaxBoostDb);
+
+        if (maxGain < 0.05)
+        {
+            return EqPointList.CreateDefault();
+        }
+
+        var frequencies = BuildBassFrequencies(ceilingHz);
+        var qualities = LocalQualities(frequencies);
+
+        // 0 增益点在矫正起点右侧 1/6 倍频程：和主层第一个推子同高，两层在交界处接上。
+        var startHz = ceilingHz * Math.Pow(2, 1.0 / 6.0);
+        var span = Math.Log(startHz / BassFloorHz);
+        var curve = new double[frequencies.Length];
+        for (var i = 0; i < frequencies.Length; i++)
+        {
+            var t = Math.Clamp(Math.Log(startHz / frequencies[i]) / span, 0, 1);
+            curve[i] = maxGain * t * t * (3 - 2 * t);
+        }
+
+        var fitted = FitPoints(curve, frequencies, qualities, BassMaxBoostDb, BassMaxCutDb);
+        var kept = fitted.Points
+            .Where(point => point.IsEndpoint
+                || (point.GainDb >= 0.05 && point.FrequencyHz > BassFloorHz + 1))
             .ToList();
 
         return EqPointList.FromPoints(kept);
@@ -1307,7 +1528,11 @@ public static class EqCurveFitter
     /// 所以正修正量封顶在「一个倍频程窗口里的需要 + 2.5 dB」；削减方向不受影响。
     /// </summary>
     private static double[] LimitNarrowBoosts(
-        double[] correction, double[] notchWidths, double[] rawCorrection)
+        double[] correction,
+        double[] notchWidths,
+        double[] rawCorrection,
+        double narrowOctaves = NarrowNotchOctaves,
+        double narrowDepthDb = NarrowNotchDepthDb)
     {
         for (var i = 0; i < correction.Length; i++)
         {
@@ -1316,10 +1541,10 @@ public static class EqCurveFitter
                 continue;
             }
 
-            // 半高宽比阈值还窄、原始深度超过 10 dB：整个放弃。留「只补一点」会在目标曲线上
+            // 半高宽比阈值还窄、原始深度超过阈值：整个放弃。留「只补一点」会在目标曲线上
             // 形成一个窄鼓包，宽 Q 的推子要堆大增益才能跟上，结果就是 +9 和 −6 交替的梳状滤波。
             // 深度用平滑前的值——平滑会把 14 dB 的零点抹到 6 dB，用平滑后的就判不成针尖了。
-            if (notchWidths[i] < NarrowNotchOctaves && rawCorrection[i] > NarrowNotchDepthDb)
+            if (notchWidths[i] < narrowOctaves && rawCorrection[i] > narrowDepthDb)
             {
                 correction[i] = 0;
             }
@@ -1340,7 +1565,8 @@ public static class EqCurveFitter
         double[] targetDb,
         double[] levels,
         IReadOnlyList<double> frequencies,
-        double floorHz)
+        double floorHz,
+        double maxBoostDb = MaxBoostDb)
     {
         var need = new double[targetDb.Length];
         for (var i = 0; i < need.Length; i++)
@@ -1359,12 +1585,12 @@ public static class EqCurveFitter
             }
         }
 
-        if (!double.IsFinite(maxNeed) || maxNeed <= MaxBoostDb)
+        if (!double.IsFinite(maxNeed) || maxNeed <= maxBoostDb)
         {
             return 0;
         }
 
-        return Math.Max(MaxBoostDb - maxNeed, -MaxAutoTargetDropDb);
+        return Math.Max(maxBoostDb - maxNeed, -MaxAutoTargetDropDb);
     }
 
     /// <summary>
@@ -1438,18 +1664,97 @@ public static class EqCurveFitter
     }
 
     /// <summary>
+    /// 低频段每个点该不该采信。显示灰线和拟合共用这一条，避免「图上标着可信、拟合却没采」。
+    ///
+    /// 两条要求：信噪比高于 <see cref="BassMinimumSnrDb"/>；不能是孤立点。
+    /// 低频贴近噪声底时，偶尔会有一两个点碰巧读得比噪声高、电平看起来也正常，
+    /// 但它们左右邻居全都测不到——拿它去拟合，低频曲线会被拽出一个假峰或假谷，
+    /// 而听感上那个位置本来什么都没有。少于三个候选点时不做孤立判断（没法判）。
+    /// </summary>
+    public static bool[] TrustedLowMask(IReadOnlyList<MeasurementPoint> points, double belowHz)
+    {
+        ArgumentNullException.ThrowIfNull(points);
+
+        var mask = new bool[points.Count];
+        var candidates = 0;
+        for (var i = 0; i < points.Count; i++)
+        {
+            var point = points[i];
+            mask[i] = point.FrequencyHz < belowHz
+                && double.IsFinite(point.LevelDb)
+                && point.SnrDb >= BassMinimumSnrDb;
+
+            if (mask[i])
+            {
+                candidates++;
+            }
+        }
+
+        if (candidates < 3)
+        {
+            return mask;
+        }
+
+        var isolated = new bool[points.Count];
+        for (var i = 0; i < points.Count; i++)
+        {
+            if (!mask[i])
+            {
+                continue;
+            }
+
+            var supported = false;
+            var from = Math.Max(0, i - BassIsolatedNeighbourhood);
+            var to = Math.Min(points.Count - 1, i + BassIsolatedNeighbourhood);
+            for (var j = from; j <= to; j++)
+            {
+                if (j != i && mask[j])
+                {
+                    supported = true;
+                    break;
+                }
+            }
+
+            if (!supported)
+            {
+                isolated[i] = true;
+            }
+        }
+
+        for (var i = 0; i < points.Count; i++)
+        {
+            if (isolated[i])
+            {
+                mask[i] = false;
+            }
+        }
+
+        return mask;
+    }
+
+    /// <summary>
     /// 把有效的测量点填成一条完整的曲线：无效点用左右两边最近的有效点在 dB 域上插值。
+    ///
+    /// <paramref name="trustBelowHz"/> 以下的点不看纯度，只要求信噪比够
+    /// （这条低频判据见 <see cref="TrustedLowMask"/>，孤立点也在这里丢掉）。
+    /// 这一段是低频层的地盘（20 Hz–矫正起点）：单频探测在那里本来就被宽带噪声压着，
+    /// 纯度必然很低，但「设备到底出不出得来这个低频」还得靠这些点回答——
+    /// 判脏丢掉它们，低频层就只能拿第一个可用点做水平外推，等于没测。
+    /// 主层不碰这一段（它从矫正起点往上才开始），所以放宽不会影响中高频。
     /// 一个可用点都没有时返回 null。
     /// </summary>
-    private static double[]? FillGaps(SweepMeasurement measurement)
+    private static double[]? FillGaps(SweepMeasurement measurement, double trustBelowHz = 0)
     {
         var points = measurement.Points;
+        var lowMask = trustBelowHz > 0 ? TrustedLowMask(points, trustBelowHz) : null;
         var result = new double[points.Count];
         var valid = new List<int>();
 
         for (var i = 0; i < points.Count; i++)
         {
-            if (points[i].IsUsable)
+            var usable = points[i].IsUsable || (lowMask is not null && lowMask[i]);
+
+            if (usable)
             {
                 valid.Add(i);
                 result[i] = points[i].LevelDb;
@@ -2050,5 +2355,96 @@ public static class EqCurveFitter
         }
 
         return Math.Round(Math.Max(peak * -1, -20), 1);
+    }
+
+    /// <summary>
+    /// 把滑杆位置（0–100）映射成「曲线允许的最高值」和预增益。
+    ///
+    /// 前 50%：α = p/50，允许最高值从 peak 降到 0，预增益同步从 −peak 抬到 0。
+    /// 这段靠截掉超出的提升换整体音量，峰值始终压在 0 dBFS，不产生削波。
+    ///
+    /// 后 50%：β = (p−50)/50，预增益固定在 0，允许最高值从 0 回升到 peak。
+    /// 峰值超出 0 dBFS 的部分就是用户主动接受的削波，比例正好是 β。
+    /// </summary>
+    internal static (double CurveLimit, double PreAmp, double AllowedClip) MapCompensation(
+        double peak, double percent)
+    {
+        if (!double.IsFinite(peak) || peak <= 0.05)
+        {
+            return (0, 0, 0);
+        }
+
+        percent = Math.Clamp(percent, 0, 100);
+        if (percent <= 50)
+        {
+            var limit = peak * (1 - percent / 50);
+            return (limit, -limit, 0);
+        }
+
+        var boostLimit = peak * (percent - 50) / 50;
+        return (boostLimit, 0, boostLimit);
+    }
+
+    /// <summary>
+    /// 主界面手改之后的重算：以用户拖出来的曲线为准，只按补偿档截断并重算预增益，
+    /// 形状不再拿测量重拟合，免得一松手就把手调的点抹掉。
+    /// </summary>
+    public static (EqPointList Points, double PreAmpDb) ApplyCompensation(
+        EqPointList input, double compensationPercent, double floorHz = CalibrationFloorHz)
+    {
+        var peak = PeakGainDb(input, floorHz);
+        var (limit, _, _) = MapCompensation(peak, compensationPercent);
+
+        var points = input;
+        foreach (var point in input.Points)
+        {
+            if (point.GainDb > limit)
+            {
+                points = points.Move(point.Id, gainDb: limit);
+            }
+        }
+
+        // 前一半把整体抬到 0 dBFS 为止，后一半预增益固定 0、允许峰值超出。
+        var preAmp = compensationPercent <= 50
+            ? Math.Round(Math.Max(-Math.Max(0, Math.Min(peak, limit)), EqLimits.MinPreAmpDb), 1)
+            : 0;
+
+        return (points, preAmp);
+    }
+
+    /// <summary>
+    /// 补偿后的预增益。前 50% 按「曲线允许值」把整体抬起来，但绝不越过 0 dBFS；
+    /// 后 50% 固定在 0，超出的部分留给 clip 统计，不在这里压。
+    /// </summary>
+    private static double ComputeCompensatedPreAmp(
+        EqPointList points, double fromHz, double compensationPercent, double curveLimit)
+    {
+        if (compensationPercent > 50)
+        {
+            return 0;
+        }
+
+        // 拟合残差可能让实际峰值略高于曲线允许值，取两者较大的那个压，才不会漏出削波。
+        var peak = Math.Max(PeakGainDb(points, fromHz), curveLimit);
+        return Math.Round(Math.Max(-Math.Max(0, peak), EqLimits.MinPreAmpDb), 1);
+    }
+
+    /// <summary>每个测量频点上实际输出超过 0 dBFS 的量；矫正起点以下记 0。</summary>
+    private static double[] ComputeClip(
+        EqPointList points, IReadOnlyList<MeasurementPoint> measured, double preAmp, double floorHz)
+    {
+        var snapshot = points.ToSnapshot();
+        var clip = new double[measured.Count];
+        for (var i = 0; i < measured.Count; i++)
+        {
+            if (measured[i].FrequencyHz < floorHz)
+            {
+                continue;
+            }
+
+            clip[i] = Math.Max(0, EqResponse.GainAt(snapshot, measured[i].FrequencyHz) + preAmp);
+        }
+
+        return clip;
     }
 }

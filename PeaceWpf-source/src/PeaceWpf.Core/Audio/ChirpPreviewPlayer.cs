@@ -20,7 +20,7 @@ public sealed class ChirpPreviewPlayer : IDisposable
     public const int SampleRate = 48000;
 
     /// <summary>扫频时长（秒）。</summary>
-    public const double Seconds = 5;
+    public const double Seconds = 10;
 
     /// <summary>起点频率。</summary>
     public const double StartHz = 20;
@@ -55,6 +55,14 @@ public sealed class ChirpPreviewPlayer : IDisposable
         var octaves = Math.Log(endHz / startHz, 2);
         var seconds = Math.Clamp(Seconds * octaves / 9.97, 1.2, Seconds);
         return PlayRange(startHz, endHz, seconds);
+    }
+
+    /// <summary>按指定时长放一段：主界面的「秒」输入框走这里。</summary>
+    public bool Play(double startHz, double endHz, double seconds)
+    {
+        startHz = Math.Clamp(startHz, 20, 20000);
+        endHz = Math.Clamp(endHz, startHz * 1.05, 20000);
+        return PlayRange(startHz, endHz, Math.Clamp(seconds, 0.5, 120));
     }
 
     private bool PlayRange(double startHz, double endHz, double seconds)
@@ -179,7 +187,8 @@ public sealed class ChirpPreviewPlayer : IDisposable
     /// 生成一段指数扫频：频率按 f(t) = f0·(f1/f0)^(t/T) 走，相位是它的积分。
     /// 用指数而不是线性，是因为听觉本身就是对数刻度——线性扫上去，低频一晃就过去了，高频停半天。
     /// </summary>
-    private static float[] Build(double startHz, double endHz, double seconds)
+    /// <summary>生成这段扫频的样本。分析端要拿同一段波形做反卷积，所以公开出来。</summary>
+    public static float[] Build(double startHz, double endHz, double seconds)
     {
         var count = (int)Math.Round(SampleRate * seconds);
         var result = new float[count];

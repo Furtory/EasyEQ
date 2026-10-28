@@ -36,6 +36,9 @@ public partial class MainViewModel : ObservableObject
     private readonly DispatcherTimer _spectrumTimer;
     private readonly DispatcherTimer _liveSaveTimer;
 
+    /// <summary>非独立模式下把推子推给正在运行的 Peace；独立模式下不用它。</summary>
+    private readonly PeaceSync _peaceSync = new();
+
     /// <summary>试听：把草稿写进 peace.txt 的节流器。手指停 150 ms 才写一次，拖动过程中不刷盘。</summary>
     private readonly DispatcherTimer _previewTimer;
 
@@ -94,8 +97,30 @@ public partial class MainViewModel : ObservableObject
     private string _bassConfigName = "EsportsBass.peace";
     private string _deviceLine = "Device: all";
 
-    [ObservableProperty]
+    // ---- 调试信息：动作 / 错误各留一段最近历史，供设置页「调试信息」和复制用 ----
+    private readonly List<(DateTime At, string Text)> _actionLog = new();
+    private readonly List<(DateTime At, string Text)> _errorLog = new();
+    private const int DebugLogLimit = 20;
+
     private string _statusText = "正在载入配置…";
+
+    /// <summary>
+    /// 调试框「动作」类：最近一次操作的结果。每改一次都追加进内部历史，
+    /// 文案里像失败的会同时记一笔到错误历史。
+    /// </summary>
+    public string StatusText
+    {
+        get => _statusText;
+        set
+        {
+            if (!SetProperty(ref _statusText, value))
+            {
+                return;
+            }
+
+            RememberStatus(value);
+        }
+    }
 
     /// <summary>找到了 EqualizerAPO 的 config 目录，读写都有落点。</summary>
     [ObservableProperty]
@@ -111,6 +136,15 @@ public partial class MainViewModel : ObservableObject
     /// <summary>EqualizerAPO 的 config 目录能不能写。写不了时保存一定失败，界面上要提前说。</summary>
     [ObservableProperty]
     private bool _isConfigWritable = true;
+
+    /// <summary>
+    /// 独立模式：打开时写自己的 <c>easyeq.txt</c>，Peace 写它的 <c>peace.txt</c>，互不覆盖；
+    /// 关闭（默认）时写 <c>peace.txt</c>，Peace 在跑就把推子同步过去。
+    /// </summary>
+    public bool IndependentMode => _uiState.IndependentMode;
+
+    /// <summary>当前模式实际写的配置文件名。</summary>
+    public string ConfigFileName => EapoConfig.FileNameFor(_uiState.IndependentMode);
 
     [ObservableProperty]
     private double _preAmpDb;
@@ -224,11 +258,17 @@ public partial class MainViewModel : ObservableObject
         _ => new EqLayerSet(_mainDraft.Saved, _bassDraft.Saved).MergedForDisplay(_savedBassLayerEnabled, Flavors),
     };
 
-    /// <summary>主层当前草稿。自动EQ 窗口在没有新结果时拿它做试听底稿。</summary>
+    /// <summary>主层当前草稿。自动EQ 预览期间草稿里就是测得的曲线。</summary>
     public EqPointList MainPoints => _mainDraft.Current;
 
-    /// <summary>低音层当前草稿。试听扫频临时叠加低频时用。</summary>
+    /// <summary>低音层当前草稿。</summary>
     public EqPointList BassPoints => _bassDraft.Current;
+
+    /// <summary>
+    /// 曲线图用的预增益。自动EQ 预览期间传 0：图上直接画矫正后的形状，
+    /// 不再整体平移；真正的预增益只体现在右侧推子（仍绑定 <see cref="PreAmpDb"/>）。
+    /// </summary>
+    public double GraphPreAmpDb => _calibrationPreview is null ? PreAmpDb : 0;
 
     /// <summary>
     /// 编辑时垫在底下的那条参考线：编辑低音时叠上左右，方便边看整体边调；
@@ -312,7 +352,7 @@ public partial class MainViewModel : ObservableObject
     public bool HasApoWarning => IsApoFound && !IsApoIncluded;
 
     public string ApoWarning => HasApoWarning
-        ? $"EqualizerAPO 还没加载 {EapoConfig.FileName}（config.txt 里缺 Include），点右边接上"
+        ? $"EqualizerAPO 还没加载 {ConfigFileName}（config.txt 里缺 Include），点右边接上"
         : string.Empty;
 
     /// <summary>
@@ -377,6 +417,133 @@ public partial class MainViewModel : ObservableObject
         ? string.Empty
         : $"有 {NonPeakingFilterCount} 个点模型表达不了的滤波器（低通 / 高通 / 带通等），保存会写成 PK";
 
+    // ---- 调试信息的分类汇总：曲线 / 环境 / 警告 / 错误；动作走 StatusText ----
+
+    /// <summary>调试框第一类「曲线」：两层各自的预设名与点数、预增益、低音是否叠加。</summary>
+    public string CurveSummary =>
+        $"左右 {_mainConfigName} · {_mainDraft.Current.Count} 点"
+        + $" · 低音 {_bassConfigName} · {_bassDraft.Current.Count} 点"
+        + $" · 增益 {PreAmpDb:0.0} dB · 低音{(IsBassLayerEnabled ? "已叠加" : "未叠加")}";
+
+    /// <summary>环境类：显示在「连接状态」那一行下面，不进调试框。回答「为什么保存了没效果」。</summary>
+    public string EnvironmentSummary =>
+        $"{ConfigDirectory} · {(IsConfigWritable ? "可写" : "只读")}"
+        + $" · {(IsApoIncluded ? "已 Include" : "没 Include")}"
+        + $" · {(_elevated ? "已提权" : "普通权限")}"
+        + $" · 写入 {ConfigFileName}";
+
+    /// <summary>调试框「动作」类：最近几条操作回执，带时间。</summary>
+    public string ActionsSummary => FormatDebugLog(_actionLog);
+
+    /// <summary>调试框「警告」类：当前持续存在、但还不算失败的状况。</summary>
+    public string WarningsSummary
+    {
+        get
+        {
+            var items = new List<string>();
+            if (!string.IsNullOrWhiteSpace(PeaceOverflowHint))
+            {
+                items.Add(PeaceOverflowHint);
+            }
+
+            if (!string.IsNullOrWhiteSpace(NonPeakingHint))
+            {
+                items.Add(NonPeakingHint);
+            }
+
+            if (!string.IsNullOrWhiteSpace(SpectrumHint))
+            {
+                items.Add(SpectrumHint);
+            }
+
+            if (HasConfigWarning)
+            {
+                items.Add(ConfigWarning);
+            }
+
+            if (HasApoWarning)
+            {
+                items.Add(ApoWarning);
+            }
+
+            return items.Count == 0 ? "（无）" : string.Join(Environment.NewLine, items);
+        }
+    }
+
+    /// <summary>调试框「错误」类：最近几条失败。</summary>
+    public string ErrorsSummary => FormatDebugLog(_errorLog);
+
+    /// <summary>「复制调试信息」：五类一次带走，粘出去就能定位。</summary>
+    public string BuildDebugReport() =>
+        string.Join(
+            Environment.NewLine,
+            $"== 环境 == {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+            EnvironmentSummary,
+            string.Empty,
+            "== 曲线 ==",
+            CurveSummary,
+            string.Empty,
+            "== 动作 ==",
+            ActionsSummary,
+            string.Empty,
+            "== 警告 ==",
+            WarningsSummary,
+            string.Empty,
+            "== 错误 ==",
+            ErrorsSummary);
+
+    private static string FormatDebugLog(List<(DateTime At, string Text)> log)
+    {
+        if (log.Count == 0)
+        {
+            return "（无）";
+        }
+
+        var start = Math.Max(0, log.Count - 6);
+        return string.Join(
+            Environment.NewLine,
+            log.Skip(start).Select(entry => $"{entry.At:HH:mm:ss} {entry.Text}"));
+    }
+
+    /// <summary>记一条动作；像失败的再记一份到错误历史。</summary>
+    private void RememberStatus(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        var entry = (DateTime.Now, text.Trim());
+        _actionLog.Add(entry);
+        if (_actionLog.Count > DebugLogLimit)
+        {
+            _actionLog.RemoveAt(0);
+        }
+
+        if (LooksLikeError(text))
+        {
+            _errorLog.Add(entry);
+            if (_errorLog.Count > DebugLogLimit)
+            {
+                _errorLog.RemoveAt(0);
+            }
+
+            OnPropertyChanged(nameof(ErrorsSummary));
+        }
+
+        OnPropertyChanged(nameof(ActionsSummary));
+    }
+
+    private static bool LooksLikeError(string text) =>
+        text.Contains("失败", StringComparison.Ordinal)
+        || text.Contains("异常", StringComparison.Ordinal)
+        || text.Contains("错误", StringComparison.Ordinal)
+        || text.Contains("写不进", StringComparison.Ordinal)
+        || text.Contains("读不了", StringComparison.Ordinal)
+        || text.Contains("接不上", StringComparison.Ordinal)
+        || text.Contains("没生效", StringComparison.Ordinal)
+        || text.Contains("不可用", StringComparison.Ordinal);
+
     public string BassLayerSummary => IsBassLayerEnabled ? "已叠加" : "未叠加";
 
     public async Task InitializeAsync()
@@ -384,7 +551,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             _configDirectory = EapoConfig.FindConfigDirectory(_uiState.ConfigDirectoryOverride);
-            _configFilePath = _configDirectory is null ? null : Path.Combine(_configDirectory, EapoConfig.FileName);
+            _configFilePath = _configDirectory is null ? null : Path.Combine(_configDirectory, ConfigFileName);
             IsConfigWritable = _configDirectory is not null && EapoConfig.CanWrite(_configDirectory);
             OnPropertyChanged(nameof(IsConfigReadOnly));
             WriteStartupReport();
@@ -397,7 +564,11 @@ public partial class MainViewModel : ObservableObject
             var main = LoadLayer(_mainConfigName);
             var bass = LoadLayer(_bassConfigName);
 
-            Post(() => ApplyLoaded(data, main, bass));
+            Post(() =>
+            {
+                ApplyLoaded(data, main, bass);
+                AutoSwitchPeaceToMix();
+            });
         }
         catch (Exception ex)
         {
@@ -612,7 +783,12 @@ public partial class MainViewModel : ObservableObject
 
     // ---- 曲线控件入口 ----
 
-    public int CreatePoint(double frequencyHz)
+    public int CreatePoint(double frequencyHz) => CreatePoint(frequencyHz, 0);
+
+    /// <summary>
+    /// 在曲线空白处建点：落点就是鼠标位置 —— 频率和增益都照实给，Q 由 Core 按邻居自己挑。
+    /// </summary>
+    public int CreatePoint(double frequencyHz, double gainDb)
     {
         if (!IsEditable)
         {
@@ -620,7 +796,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         FlushQualityNow();
-        if (!ActiveDraft.Current.TryAdd(frequencyHz, out var list, out var created))
+        if (!ActiveDraft.Current.TryAdd(frequencyHz, gainDb, out var list, out var created))
         {
             StatusText = "这个位置离已有的点太近，换一个地方点。";
             return -1;
@@ -669,6 +845,36 @@ public partial class MainViewModel : ObservableObject
         ActiveDraft.Preview(next);
         ActiveDraft.Commit();
         _lastEditDraft = ActiveDraft;
+    }
+
+    /// <summary>
+    /// 右键首尾端点：增益归零。端点不能删，所以右键在它们身上只做这一件事。
+    /// </summary>
+    public void ResetPoint(int id)
+    {
+        if (!IsEditable)
+        {
+            return;
+        }
+
+        FlushQualityNow();
+        var point = ActiveDraft.Current.Find(id);
+        if (point is null)
+        {
+            return;
+        }
+
+        var next = ActiveDraft.Current.Move(id, null, 0);
+        if (next.Equals(ActiveDraft.Current))
+        {
+            StatusText = $"{EqFormat.Frequency(point.FrequencyHz)} 本来就在 0 dB。";
+            return;
+        }
+
+        ActiveDraft.Preview(next);
+        ActiveDraft.Commit();
+        _lastEditDraft = ActiveDraft;
+        StatusText = $"{EqFormat.Frequency(point.FrequencyHz)} 增益已归零";
     }
 
     public void ChangePointQuality(int id, double quality)
@@ -922,6 +1128,23 @@ public partial class MainViewModel : ObservableObject
     }
 
     // ---- 自动EQ：扫频 + 麦克风 ----
+
+    /// <summary>
+    /// 自动EQ 上次导入的麦克风矫正曲线文件；null 表示不矫正。
+    /// 只存路径不存内容：曲线文件可能被用户换掉（换了麦克风、重新下载），每次打开都重新读。
+    /// </summary>
+    public string? MicCalibrationFile => _uiState.MicCalibrationFile;
+
+    /// <summary>
+    /// 记住（或忘掉）麦克风矫正曲线。传 null 表示清除，下次打开自动EQ 不再自动套上。
+    /// 不在这里校验文件能不能读：那是窗口打开时的事，这里只负责记路径。
+    /// </summary>
+    public void SetMicCalibrationFile(string? path)
+    {
+        _uiState.MicCalibrationFile = string.IsNullOrWhiteSpace(path) ? null : path;
+        UiStateStore.Save(_uiState);
+    }
+
     /// <summary>测量期间 peace.txt 原本的内容；null 表示还没进入测量态。</summary>
     private string? _calibrationBackup;
 
@@ -1487,6 +1710,14 @@ public partial class MainViewModel : ObservableObject
                 + $"{bands.Count} 段（{range}）已整层替换「低音」层";
         }
 
+        // 预增益只压不提，目标整体下移也含在曲线里：用曲线中频的净变化才算得准，
+        // 单看预增益在全削减曲线上会报「不变」，单把两个数相加又会重复计算。
+        var overall = plan.OverallGainDb;
+        if (overall < -0.05)
+        {
+            message += $" · 中频整体低 {Math.Abs(overall):0.0} dB（可用系统音量补回来）";
+        }
+
         StatusText = message + " · 正在试听，保存才写回预设";
         return StatusText;
     }
@@ -1561,7 +1792,8 @@ public partial class MainViewModel : ObservableObject
                 _uiState.SetMainFlavors(_mainConfigName, _mainDraft.CurrentFlavors);
                 SaveLayer(_mainConfigName, _mainDraft.Current, out _);
                 _mainConfigName = name;
-                var presetPoints = LoadLayer(name) ?? EqPointList.CreateDefault();
+                // 自动EQ 预览期间切走：草稿仍然接测得的曲线，图上不跟着变。
+                var presetPoints = _calibrationPreview?.Main ?? LoadLayer(name) ?? EqPointList.CreateDefault();
                 var presetFlavors = _uiState.TryGetMainFlavors(_mainConfigName, out var storedFlavors)
                     ? storedFlavors
                     : FlavorSet.CreateDefault();
@@ -1575,7 +1807,7 @@ public partial class MainViewModel : ObservableObject
                 SaveLayer(_bassConfigName, _bassDraft.Current, out _);
                 _bassConfigName = name;
                 _bassDraft.End();
-                _bassDraft.AcceptSaved(LoadLayer(name) ?? EqPointList.CreateDefault());
+                _bassDraft.AcceptSaved(_calibrationPreview?.Bass ?? LoadLayer(name) ?? EqPointList.CreateDefault());
             }
 
             PersistState();
@@ -1588,6 +1820,507 @@ public partial class MainViewModel : ObservableObject
         {
             _presetSwitch = false;
         }
+    }
+
+    // ---- 自动EQ 预览：新建「左右矫正 / 低音矫正」，曲线钉在主界面 ----
+
+    private sealed class CalibrationPreviewState
+    {
+        public required EqPointList Main { get; set; }
+        public EqPointList? Bass { get; set; }
+        public double PreAmpDb { get; set; }
+        public string MainBefore { get; init; } = string.Empty;
+        public string BassBefore { get; init; } = string.Empty;
+        public string MainPreset { get; init; } = string.Empty;
+        public string BassPreset { get; init; } = string.Empty;
+        public bool MainPresetExisted { get; init; }
+        public bool BassPresetExisted { get; init; }
+    }
+
+    private CalibrationPreviewState? _calibrationPreview;
+
+    /// <summary>自动EQ 测量中：这段时间主窗口的试听写盘会和测量抢 peace.txt，必须停。</summary>
+    private bool _calibrationMeasuring;
+
+    /// <summary>主界面现在是不是在显示自动EQ 的预览曲线。</summary>
+    public bool HasCalibrationPreview => _calibrationPreview is not null;
+
+    /// <summary>自动EQ 测一轮开始/结束时调用，期间禁止主界面预览写 peace.txt。</summary>
+    public void SetCalibrationMeasuring(bool measuring) => _calibrationMeasuring = measuring;
+
+    /// <summary>
+    /// 进入自动EQ 预览：新建「左右矫正 / 低音矫正」两个预设并切过去。
+    /// 曲线先给平直，测量结果由 <see cref="UpdateCalibrationPreview"/> 填进来。
+    /// </summary>
+    public async Task<bool> BeginCalibrationPreviewAsync()
+    {
+        if (_configDirectory is null)
+        {
+            return false;
+        }
+
+        if (_calibrationPreview is not null)
+        {
+            return true;
+        }
+
+        if (!await EnsureMainLayerForCalibrationAsync().ConfigureAwait(true))
+        {
+            return false;
+        }
+
+        var directory = _configDirectory;
+        var mainName = MakeUniquePresetName(directory, "左右矫正" + PeaceConfig.Extension);
+        var bassName = MakeUniquePresetName(directory, "低音矫正" + PeaceConfig.Extension);
+        var mainExisted = File.Exists(Path.Combine(directory, mainName));
+        var bassExisted = File.Exists(Path.Combine(directory, bassName));
+
+        SaveLayer(mainName, EqPointList.CreateDefault(), out _);
+        SaveLayer(bassName, EqPointList.CreateDefault(), out _);
+
+        _calibrationPreview = new CalibrationPreviewState
+        {
+            Main = EqPointList.CreateDefault(),
+            Bass = null,
+            PreAmpDb = 0,
+            MainBefore = _mainConfigName,
+            BassBefore = _bassConfigName,
+            MainPreset = mainName,
+            BassPreset = bassName,
+            MainPresetExisted = mainExisted,
+            BassPresetExisted = bassExisted,
+        };
+
+        SwitchPreset(mainName, isMain: true);
+        SwitchPreset(bassName, isMain: false);
+        RefreshPresets();
+        SyncPresetSelection();
+        return true;
+    }
+
+    /// <summary>
+    /// 自动EQ 每次拟合出结果就推过来：写进主界面草稿、预增益和两个矫正预设。
+    ///
+    /// 拖动分界线时 fit 会连发很多次，那条路传 <paramref name="commit"/> = false：
+    /// 只更新界面、不进撤回栈、不写预设文件（松手那一次才落盘）。否则一次拖动能塞进
+    /// 几十条撤销记录，磁盘也被刷几十遍。
+    /// </summary>
+    public void UpdateCalibrationPreview(CalibrationPlan plan, EqPointList? bass, bool commit = true)
+    {
+        if (_calibrationPreview is not { } state)
+        {
+            return;
+        }
+
+        state.Main = plan.Points;
+        state.Bass = bass;
+        state.PreAmpDb = plan.PreAmpDb;
+
+        ApplyPreviewToDrafts(state.Main, state.Bass, commit);
+        if (commit)
+        {
+            PersistPreviewFiles(state);
+        }
+
+        SetPreviewPreAmp(state.PreAmpDb);
+
+        RaiseDerived();
+        SchedulePreview();
+    }
+
+    /// <summary>主界面拖完曲线：把草稿接回预览，再通知自动EQ 按滑条重算。</summary>
+    public void NotifyCalibrationEdited()
+    {
+        if (_calibrationPreview is not { } state)
+        {
+            return;
+        }
+
+        if (Mode == MainMode.BassLayer)
+        {
+            state.Bass = _bassDraft.Current;
+        }
+        else
+        {
+            state.Main = _mainDraft.Current;
+        }
+
+        RaiseDerived();
+        CalibrationEdited?.Invoke();
+    }
+
+    /// <summary>自动EQ 重算完的结果：写回草稿和预览，主界面立刻看到修正后的曲线。</summary>
+    public void ApplyEditedCalibration(EqPointList main, EqPointList? bass, double preAmpDb)
+    {
+        if (_calibrationPreview is not { } state)
+        {
+            return;
+        }
+
+        state.Main = main;
+        if (bass is not null)
+        {
+            state.Bass = bass;
+        }
+
+        state.PreAmpDb = preAmpDb;
+        ApplyPreviewToDrafts(state.Main, state.Bass);
+        PersistPreviewFiles(state);
+        SetPreviewPreAmp(preAmpDb);
+
+        RaiseDerived();
+        SchedulePreview();
+    }
+
+    /// <summary>主界面曲线拖完的通知，订阅者是自动EQ 窗口。</summary>
+    public event Action? CalibrationEdited;
+
+    /// <summary>预览期间预增益由算法决定，推子锁住不让拖。</summary>
+    public bool IsPreampEnabled => !HasCalibrationPreview && IsApoFound;
+
+    private void ApplyPreviewToDrafts(EqPointList main, EqPointList? bass, bool commit = true)
+    {
+        if (!_mainDraft.IsEditing)
+        {
+            _mainDraft.Begin();
+        }
+
+        _mainDraft.Preview(main);
+        if (commit)
+        {
+            _mainDraft.Commit();
+        }
+
+        if (bass is not null)
+        {
+            if (!_bassDraft.IsEditing)
+            {
+                _bassDraft.Begin();
+            }
+
+            _bassDraft.Preview(bass);
+            if (commit)
+            {
+                _bassDraft.Commit();
+            }
+        }
+    }
+
+    private void PersistPreviewFiles(CalibrationPreviewState state)
+    {
+        SaveLayer(state.MainPreset, state.Main, out _);
+        if (state.Bass is not null)
+        {
+            SaveLayer(state.BassPreset, state.Bass, out _);
+        }
+    }
+
+    private void SetPreviewPreAmp(double preAmpDb)
+    {
+        _loading = true;
+        try
+        {
+            PreAmpDb = Math.Round(Math.Clamp(preAmpDb, EqLimits.MinPreAmpDb, EqLimits.MaxPreAmpDb), 1);
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    /// <summary>
+    /// 套用自动EQ 结果：写进「当前下拉选中的」配置，覆盖它。
+    /// 用户在预览期间切到哪个配置，就覆盖哪个。
+    /// </summary>
+    public Task<string> ApplyCalibrationPreviewAsync()
+    {
+        if (_calibrationPreview is not { } state)
+        {
+            return Task.FromResult("没有自动EQ 结果。");
+        }
+
+        var mainTarget = _mainConfigName;
+        var bassTarget = _bassConfigName;
+
+        SaveLayer(mainTarget, state.Main, out _);
+        if (state.Bass is not null)
+        {
+            SaveLayer(bassTarget, state.Bass, out _);
+        }
+
+        if (!_mainDraft.IsEditing)
+        {
+            _mainDraft.Begin();
+        }
+
+        _mainDraft.Preview(state.Main);
+        _mainDraft.Commit();
+        _lastEditDraft = _mainDraft;
+
+        if (state.Bass is not null)
+        {
+            if (!_bassDraft.IsEditing)
+            {
+                _bassDraft.Begin();
+            }
+
+            _bassDraft.Preview(state.Bass);
+            _bassDraft.Commit();
+
+            if (!IsBassLayerEnabled)
+            {
+                IsBassLayerEnabled = true;
+            }
+        }
+
+        _loading = true;
+        try
+        {
+            PreAmpDb = Math.Round(Math.Clamp(state.PreAmpDb, EqLimits.MinPreAmpDb, EqLimits.MaxPreAmpDb), 1);
+            _savedPreAmpDb = PreAmpDb;
+            _uiState.SetMainPreAmp(mainTarget, PreAmpDb);
+        }
+        finally
+        {
+            _loading = false;
+        }
+
+        _calibrationPreview = null;
+        PersistState();
+        RaiseDerived();
+        SchedulePreview();
+
+        var message = $"已覆盖 {mainTarget} · 左右 {state.Main.Count} 点 · 预增益 {PreAmpDb:+0.0;-0.0;0.0} dB";
+        if (state.Bass is not null)
+        {
+            message += $" · 低音 {bassTarget} 已替换";
+        }
+
+        return Task.FromResult(message);
+    }
+
+    /// <summary>取消自动EQ 预览：切回进入前的两个配置，删掉这次新建的矫正预设。</summary>
+    public void CancelCalibrationPreview()
+    {
+        if (_calibrationPreview is not { } state)
+        {
+            return;
+        }
+
+        _calibrationPreview = null;
+
+        SwitchPreset(state.MainBefore, isMain: true);
+        SwitchPreset(state.BassBefore, isMain: false);
+
+        if (!state.MainPresetExisted)
+        {
+            TryDeletePreset(state.MainPreset);
+        }
+
+        if (!state.BassPresetExisted)
+        {
+            TryDeletePreset(state.BassPreset);
+        }
+
+        RefreshPresets();
+        SyncPresetSelection();
+        RaiseDerived();
+        SchedulePreview();
+    }
+
+    /// <summary>RefreshPresets 会按「旧选中」恢复下拉，配置名变了之后要把两个下拉拉回当前配置。</summary>
+    private void SyncPresetSelection()
+    {
+        _presetSwitch = true;
+        try
+        {
+            SelectedMainPreset = _mainConfigName;
+            SelectedBassPreset = _bassConfigName;
+        }
+        finally
+        {
+            _presetSwitch = false;
+        }
+    }
+
+    private void TryDeletePreset(string name)
+    {
+        var path = LayerPath(name);
+        if (path is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 删不掉就算了，下次预览会换一个新名字。
+        }
+    }
+
+    // ---- 自动切换：组合列表 ----
+
+    /// <summary>组合列表变了（增删、改预设、改热键、改进程）。热键和进程监听靠它刷新。</summary>
+    public event EventHandler? AutoSwitchProfilesChanged;
+
+    /// <summary>组合列表本体，和 <see cref="UiState"/> 里那份是同一个列表。</summary>
+    public List<UiAutoSwitch> AutoSwitchProfiles
+    {
+        get
+        {
+            _uiState.AutoSwitchProfiles ??= new List<UiAutoSwitch>();
+            return _uiState.AutoSwitchProfiles;
+        }
+    }
+
+    /// <summary>当前左右层真正在用的预设文件名（不一定是下拉里选中的那个）。</summary>
+    public string MainPresetName => _mainConfigName;
+
+    /// <summary>当前低音层真正在用的预设文件名。</summary>
+    public string BassPresetName => _bassConfigName;
+
+    /// <summary>这个页面「改了就存」：写盘之后通知热键 / 前台进程监听重新挂。</summary>
+    public void SaveAutoSwitchProfiles()
+    {
+        PersistState();
+        AutoSwitchProfilesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// 教程最后一步用来讲解的组合：只在本来一组都没有时，用教程那两条临时曲线建一行。
+    ///
+    /// 这一行只挂在内存里，不调用 <see cref="SaveAutoSwitchProfiles"/>，也不改用户已有的组合；
+    /// 教程结束或跳过时由 <see cref="EndTutorialScenario"/> 摘掉。强杀时因为没落过盘，也不会留下。
+    /// </summary>
+    public UiAutoSwitch? TutorialAutoSwitchDemo { get; private set; }
+
+    public UiAutoSwitch? EnsureTutorialAutoSwitchDemo()
+    {
+        if (!_tutorialScenario)
+        {
+            return null;
+        }
+
+        if (TutorialAutoSwitchDemo is not null)
+        {
+            return TutorialAutoSwitchDemo;
+        }
+
+        // 用户已经有组合就让他看自己的，不自作主张塞演示数据。
+        if (AutoSwitchProfiles.Count > 0)
+        {
+            return null;
+        }
+
+        var demo = new UiAutoSwitch
+        {
+            MainPreset = _mainConfigName,
+            BassPreset = _bassConfigName,
+            BassEnabled = IsBassLayerEnabled,
+        };
+
+        AutoSwitchProfiles.Add(demo);
+        TutorialAutoSwitchDemo = demo;
+        return demo;
+    }
+
+    /// <summary>把教程临时建的那一组从内存里摘掉；必须在写盘之前调用。</summary>
+    public void RemoveTutorialAutoSwitchDemo()
+    {
+        if (TutorialAutoSwitchDemo is not { } demo)
+        {
+            return;
+        }
+
+        AutoSwitchProfiles.Remove(demo);
+        TutorialAutoSwitchDemo = null;
+    }
+
+    /// <summary>
+    /// 套用一组组合：切左右预设、切低音预设、按组合改叠加开关。
+    /// 正在编辑时先落盘 —— 和手动切预设一样，切走不丢改动。
+    /// </summary>
+    public bool ApplyAutoSwitch(UiAutoSwitch profile, out string message)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+
+        if (_configDirectory is null)
+        {
+            message = "找不到 EqualizerAPO 的 config 目录，组合切不过去。";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(profile.MainPreset) || string.IsNullOrWhiteSpace(profile.BassPreset))
+        {
+            message = "这一组还没选好左右和低音曲线。";
+            return false;
+        }
+
+        var main = FindPreset(profile.MainPreset);
+        var bass = FindPreset(profile.BassPreset);
+        if (main is null || bass is null)
+        {
+            message = "这一组里的预设已经被删了，先去「自动切换」把它改回现成的。";
+            return false;
+        }
+
+        if (IsEditing && !SaveBlocking())
+        {
+            message = "正在编辑，当前改动没能保存，组合没有切换。";
+            return false;
+        }
+
+        if (!string.Equals(_mainConfigName, main, StringComparison.OrdinalIgnoreCase))
+        {
+            SelectedMainPreset = main;
+        }
+
+        if (!string.Equals(_bassConfigName, bass, StringComparison.OrdinalIgnoreCase))
+        {
+            SelectedBassPreset = bass;
+        }
+
+        if (IsBassLayerEnabled != profile.BassEnabled)
+        {
+            // 不在编辑里，这一改会自己走 SaveBlocking，把合并结果写进 peace.txt。
+            IsBassLayerEnabled = profile.BassEnabled;
+        }
+
+        PersistState();
+
+        message = "已切到组合：" + main + " / " + bass
+            + (profile.BassEnabled ? " · 叠加低音" : " · 不叠加低音");
+        StatusText = message;
+        return true;
+    }
+
+    /// <summary>把组合里存的名字对到现成的预设上；两边都不认就返回 null。</summary>
+    private string? FindPreset(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        // 列表里没有、但正是当前在用的那份（可能还没落盘）也算数。
+        if (string.Equals(name, _mainConfigName, StringComparison.OrdinalIgnoreCase))
+        {
+            return _mainConfigName;
+        }
+
+        if (string.Equals(name, _bassConfigName, StringComparison.OrdinalIgnoreCase))
+        {
+            return _bassConfigName;
+        }
+
+        return AvailablePresets.FirstOrDefault(item =>
+            string.Equals(item, name, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>把当前推子的值记到当前左右预设名下。切预设、保存时调用。</summary>
@@ -2002,6 +2735,10 @@ public partial class MainViewModel : ObservableObject
         }
 
         _tutorialScenario = false;
+
+        // 演示组合只活在教程里：先摘掉，后面 PersistState 才不会把它写进配置。
+        RemoveTutorialAutoSwitchDemo();
+
         _mainDraft.Cancel();
         _mainDraft.End();
         _bassDraft.Cancel();
@@ -2129,7 +2866,7 @@ public partial class MainViewModel : ObservableObject
         RaiseDerived();
         StatusText = mode switch
         {
-            MainMode.MainLayer => "左右：点空白建点，拖动改频率/增益，滚轮调 Q，右键删点。试听里不叠低音层，退出编辑后才按勾选。",
+            MainMode.MainLayer => "左右：按住曲线拖最近的推子，曲线始终经过鼠标；空白处按下就在鼠标处建点（Q 按邻居自动定）。滚轮调 Q，右键普通点删除、首尾端点归零。试听里不叠低音层，退出编辑后才按勾选。",
             MainMode.BassLayer => "低音：这条曲线会和左右曲线叠加后一起试听；退出编辑后才按勾选决定是否保留叠加。",
             _ => StatusText,
         };
@@ -2229,8 +2966,16 @@ public partial class MainViewModel : ObservableObject
 
         if (error is not null)
         {
-            StatusText = $"按勾选重写 {EapoConfig.FileName} 失败：{error}";
+            StatusText = $"按勾选重写 {ConfigFileName} 失败：{error}";
             return false;
+        }
+
+        // 收回勾选设置之后，Peace 那边也要跟上：写 Mix 预设再推推子。
+        // 少这一步就会出现「peace.txt 已经叠回来了，Peace 还停在编辑时的只主层」。
+        if (!_uiState.IndependentMode)
+        {
+            WriteMixPreset(merged.Points);
+            _peaceSync.Queue(merged.Points, PreAmpDb);
         }
 
         _previewLastText = text;
@@ -2366,7 +3111,7 @@ public partial class MainViewModel : ObservableObject
             {
                 try
                 {
-                    var backup = Path.Combine(UiState.Directory, EapoConfig.FileName + ".bak");
+                    var backup = Path.Combine(UiState.Directory, Path.GetFileName(request.PeacePath) + ".bak");
                     Directory.CreateDirectory(UiState.Directory);
                     File.Copy(request.PeacePath, backup, overwrite: true);
                 }
@@ -2382,6 +3127,14 @@ public partial class MainViewModel : ObservableObject
             var overflow = request.Merged.Count > EqLimits.PeaceDisplayBands
                 ? $" · 超过 {EqLimits.PeaceDisplayBands} 个，Peace 显示不全"
                 : string.Empty;
+
+            // 非独立模式：文件已经落到 peace.txt，Peace 如果在跑就把推子同步过去。
+            // 独立模式不碰 Peace；推送失败也不影响这次保存。
+            if (!_uiState.IndependentMode)
+            {
+                WriteMixPreset(request.Merged.Points);
+                _peaceSync.Queue(request.Merged.Points, request.PreAmp);
+            }
 
             return new SaveOutcome(
                 true,
@@ -2563,7 +3316,7 @@ public partial class MainViewModel : ObservableObject
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Post(() => StatusText = $"读不了 {EapoConfig.FileName}：{ex.Message}");
+            Post(() => StatusText = $"读不了 {ConfigFileName}：{ex.Message}");
             return null;
         }
     }
@@ -2589,6 +3342,8 @@ public partial class MainViewModel : ObservableObject
             .Select(Path.GetFileName)
             .Where(name => !string.IsNullOrEmpty(name))
             .Select(name => name!)
+            // Peace 的专用混音配置只给同步用，不该出现在用户的下拉里。
+            .Where(name => !string.Equals(name, PeaceSync.MixPresetName, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
         // 只保证“这两层现在用的那两个文件”在列表里：它们可能还没落盘，选中时要有个名字。
@@ -3033,7 +3788,7 @@ public partial class MainViewModel : ObservableObject
         IsApoFound = _configDirectory is not null;
 
         var text = _configDirectory is null ? null : ApoSetup.TryRead(_configDirectory);
-        IsApoIncluded = text is not null && ApoSetup.IsIncluded(text, EapoConfig.FileName);
+        IsApoIncluded = text is not null && ApoSetup.IsIncluded(text, ConfigFileName);
     }
 
     /// <summary>
@@ -3050,10 +3805,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         var directory = _configDirectory;
+        var includeName = ConfigFileName;
+        var excludeName = EapoConfig.FileNameFor(!_uiState.IndependentMode);
         StatusText = "正在接上 EqualizerAPO…";
 
         var result = await Task
-            .Run(() => ApoSetup.EnsureInclude(directory, EapoConfig.FileName, UiState.Directory))
+            .Run(() => ApoSetup.SwitchInclude(directory, includeName, excludeName, UiState.Directory))
             .ConfigureAwait(true);
 
         RefreshApoState();
@@ -3072,11 +3829,158 @@ public partial class MainViewModel : ObservableObject
             var backup = result.BackupPath is null
                 ? "（原文件没备份成功，但已经改了）"
                 : $"（原文件备份到 {result.BackupPath}）";
-            StatusText = $"已接入：{ApoSetup.ConfigFileName} 里加了 {ApoSetup.IncludeKeyword} {EapoConfig.FileName} {backup}";
+            StatusText = $"已接入：{ApoSetup.ConfigFileName} 里加了 {ApoSetup.IncludeKeyword} {includeName} {backup}";
             return;
         }
 
-        StatusText = $"本来就接好了：{ApoSetup.ConfigFileName} 里已经有 {ApoSetup.IncludeKeyword} {EapoConfig.FileName}";
+        StatusText = $"本来就接好了：{ApoSetup.ConfigFileName} 里已经有 {ApoSetup.IncludeKeyword} {includeName}";
+    }
+
+    /// <summary>
+    /// 打开 / 关闭独立模式。这是一次换档：先把当前已保存的结果写到新文件，
+    /// 再把 config.txt 的 Include 二选一切过去，最后才改内存里的开关。
+    /// 任何一步失败都停在原模式，不写 UiState；返回 null 表示成功，否则是错误原因。
+    /// </summary>
+    public async Task<string?> SetIndependentModeAsync(bool on)
+    {
+        if (_uiState.IndependentMode == on)
+        {
+            return null;
+        }
+
+        var directory = _configDirectory;
+        var newName = EapoConfig.FileNameFor(on);
+        var oldName = EapoConfig.FileNameFor(!on);
+
+        if (directory is not null)
+        {
+            var layers = new EqLayerSet(_mainDraft.Saved, _bassDraft.Saved);
+            if (!layers.TryMerge(IsBassLayerEnabled, Flavors, out var merged, out var mergeError))
+            {
+                return "切换模式前合并曲线失败：" + mergeError;
+            }
+
+            var text = EapoConfig.Build(merged.Points, _savedPreAmpDb, _savedBalance, _deviceLine);
+            var newPath = Path.Combine(directory, newName);
+            var writeError = await Task.Run(() => WriteTextOrError(newPath, text)).ConfigureAwait(true);
+            if (writeError is not null)
+            {
+                return $"写 {newName} 失败：{writeError}";
+            }
+
+            var switched = await Task
+                .Run(() => ApoSetup.SwitchInclude(directory, newName, oldName, UiState.Directory))
+                .ConfigureAwait(true);
+
+            if (switched.Error is not null)
+            {
+                return $"改 {ApoSetup.ConfigFileName} 失败：{switched.Error}";
+            }
+        }
+
+        // 换档完成：文件、入口、内存状态一起切。
+        EndPreviewSession();
+        _previewLastText = null;
+        _uiState.IndependentMode = on;
+        _configFilePath = directory is null ? null : Path.Combine(directory, newName);
+        UiStateStore.Save(_uiState);
+        RefreshApoState();
+
+        OnPropertyChanged(nameof(IndependentMode));
+        OnPropertyChanged(nameof(ConfigFileName));
+        OnPropertyChanged(nameof(ConfigWarning));
+        OnPropertyChanged(nameof(HasConfigWarning));
+
+        if (!on)
+        {
+            // 回到 peace.txt：Peace 正开着的话，马上把推子对齐一次。
+            var layers = new EqLayerSet(_mainDraft.Saved, _bassDraft.Saved);
+            if (layers.TryMerge(IsBassLayerEnabled, Flavors, out var merged, out _))
+            {
+                WriteMixPreset(merged.Points);
+                _peaceSync.Queue(merged.Points, _savedPreAmpDb);
+            }
+        }
+
+        StatusText = on
+            ? $"独立模式已打开：以后写 {EapoConfig.IndependentFileName}，Peace 的 {EapoConfig.FileName} 不再被动。"
+            : $"独立模式已关闭：以后写 {EapoConfig.FileName}，Peace 在跑时推子会跟着同步。";
+        return null;
+    }
+
+    /// <summary>
+    /// 打开程序就把 Peace 切到混音配置，不用等进编辑模式。
+    /// 非独立模式才有这一步；Peace 没开时只把 EsportsMix 落到磁盘，
+    /// 等它下次启动扫到，之后的调整会再触发切换。
+    /// </summary>
+    private void AutoSwitchPeaceToMix()
+    {
+        PeaceSync.Log($"启动切换：independent={_uiState.IndependentMode} dir={_configDirectory ?? "(null)"}");
+
+        if (_uiState.IndependentMode || _configDirectory is null)
+        {
+            return;
+        }
+
+        var layers = new EqLayerSet(_mainDraft.Saved, _bassDraft.Saved);
+        if (!layers.TryMerge(IsBassLayerEnabled, Flavors, out var merged, out var mergeError))
+        {
+            PeaceSync.Log("启动切换：合并失败 " + mergeError);
+            return;
+        }
+
+        WriteMixPreset(merged.Points);
+        _peaceSync.Queue(merged.Points, _savedPreAmpDb);
+    }
+
+    /// <summary>
+    /// 把合并结果也写进 Peace 的专用混音预设（EsportsMix），并保证它有配置 Id。
+    /// 只在非独立模式写；失败不影响主流程——那份文件只是给 Peace 看的。
+    /// </summary>
+    private void WriteMixPreset(IReadOnlyList<EqPoint> points)
+    {
+        if (_uiState.IndependentMode || _configDirectory is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var path = Path.Combine(_configDirectory, PeaceSync.MixPresetName);
+            if (!PeaceConfig.Save(path, points, out var saveError))
+            {
+                PeaceSync.Log($"写 {PeaceSync.MixPresetName} 失败：{saveError}");
+                return;
+            }
+
+            if (!PeaceConfig.EnsureConfigurationId(path, PeaceSync.MixPresetId, out var idError))
+            {
+                PeaceSync.Log($"给 {PeaceSync.MixPresetName} 写 Id 失败：{idError}");
+                return;
+            }
+
+            PeaceSync.Log($"已写 {PeaceSync.MixPresetName}：{points.Count} 段");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 混音预设写不进去不该挡住真正要写的 peace.txt。
+            PeaceSync.Log("写混音预设异常：" + ex.Message);
+        }
+    }
+
+    /// <summary>写一份文本；失败返回错误原因，不抛。</summary>
+    private static string? WriteTextOrError(string path, string text)
+    {
+        try
+        {
+            EapoConfig.ClearReadOnly(path);
+            File.WriteAllText(path, text, new UTF8Encoding(false));
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return ex.Message;
+        }
     }
 
     private void ApplyLoaded(EapoConfigData? data, EqPointList? mainLayer, EqPointList? bassLayer)
@@ -3134,7 +4038,7 @@ public partial class MainViewModel : ObservableObject
         StatusText = _configDirectory is null
             ? "找不到 EqualizerAPO 的 config 目录，只能看本地缓存。"
             : !IsApoIncluded
-                ? $"已载入 · 左右 {main.Count} 点 · 低音 {bass.Count} 点 · 但 APO 还没加载 {EapoConfig.FileName}，点顶栏「接入 APO」"
+                ? $"已载入 · 左右 {main.Count} 点 · 低音 {bass.Count} 点 · 但 APO 还没加载 {ConfigFileName}，点顶栏「接入 APO」"
                 : $"已载入 · 左右 {main.Count} 点（{_mainConfigName}）· 低音 {bass.Count} 点（{_bassConfigName}）";
     }
 
@@ -3149,6 +4053,26 @@ public partial class MainViewModel : ObservableObject
         _uiState.PeakGuardEnabled = IsPeakGuardEnabled;
         _uiState.MainConfig = _mainConfigName;
         _uiState.BassConfig = _bassConfigName;
+
+        // 教程最后一步的演示组合只活在内存里：写盘时把它从这份快照里滤掉，
+        // 否则教程里关窗口、或后台切进程触发保存，都会把它写成用户的配置。
+        var demo = TutorialAutoSwitchDemo;
+        var profiles = _uiState.AutoSwitchProfiles;
+        if (demo is not null && profiles is not null && profiles.Contains(demo))
+        {
+            _uiState.AutoSwitchProfiles = profiles.Where(item => !ReferenceEquals(item, demo)).ToList();
+            try
+            {
+                UiStateStore.Save(_uiState);
+            }
+            finally
+            {
+                _uiState.AutoSwitchProfiles = profiles;
+            }
+
+            return;
+        }
+
         UiStateStore.Save(_uiState);
     }
 
@@ -3249,7 +4173,7 @@ public partial class MainViewModel : ObservableObject
     public void RecheckApoConnection()
     {
         _configDirectory = EapoConfig.FindConfigDirectory(_uiState.ConfigDirectoryOverride);
-        _configFilePath = _configDirectory is null ? null : Path.Combine(_configDirectory, EapoConfig.FileName);
+        _configFilePath = _configDirectory is null ? null : Path.Combine(_configDirectory, ConfigFileName);
         IsConfigWritable = _configDirectory is not null && EapoConfig.CanWrite(_configDirectory);
 
         OnPropertyChanged(nameof(ConfigDirectory));
@@ -3292,7 +4216,7 @@ public partial class MainViewModel : ObservableObject
 
         _uiState.ConfigDirectoryOverride = candidate;
         _configDirectory = candidate;
-        _configFilePath = Path.Combine(candidate, EapoConfig.FileName);
+        _configFilePath = Path.Combine(candidate, ConfigFileName);
         IsConfigWritable = EapoConfig.CanWrite(candidate);
 
         OnPropertyChanged(nameof(ConfigDirectory));
@@ -3314,6 +4238,27 @@ public partial class MainViewModel : ObservableObject
             _uiState.ShowWindowOnStart = value;
             UiStateStore.Save(_uiState);
         }
+    }
+
+    /// <summary>
+    /// 点关闭按钮时做什么。设置里的单选框和首次关闭的询问都写这里，
+    /// 但只有「记住选择」才写盘 —— 这就是它和 <see cref="RememberCloseAction"/> 的区别。
+    /// </summary>
+    public CloseAction CloseAction
+    {
+        get => _uiState.CloseAction;
+        set => RememberCloseAction(value);
+    }
+
+    /// <summary>关闭行为是不是用户记住过的；false 时每次关闭都要问。</summary>
+    public bool IsCloseActionRemembered => _uiState.CloseActionRemembered;
+
+    /// <summary>记住下次关闭怎么做。只改选择、不触发任何界面动作。</summary>
+    public void RememberCloseAction(CloseAction action)
+    {
+        _uiState.CloseAction = action;
+        _uiState.CloseActionRemembered = true;
+        UiStateStore.Save(_uiState);
     }
 
     partial void OnBalanceChanged(double value)
@@ -3393,10 +4338,12 @@ public partial class MainViewModel : ObservableObject
             Spectrum = null;
             PeakDb = -90;
             SpectrumHint = "电平 / 频谱不可用：抓不到系统输出";
+            OnPropertyChanged(nameof(WarningsSummary));
             return;
         }
 
         SpectrumHint = string.Empty;
+        OnPropertyChanged(nameof(WarningsSummary));
         if (!_spectrumTimer.IsEnabled)
         {
             _spectrumTimer.Start();
@@ -3528,7 +4475,7 @@ public partial class MainViewModel : ObservableObject
     {
         // 试听扫频正在临时叠加低音：这时按「编辑左右不叠低音」的规则写盘，
         // 会把刚叠上去的低频冲掉，扫频听到一半就变味。
-        if (_loading || _previewSuspended || _sweepPreviewActive || !IsApoFound || !IsConfigWritable || _configFilePath is null)
+        if (_loading || _previewSuspended || _sweepPreviewActive || _calibrationMeasuring || !IsApoFound || !IsConfigWritable || _configFilePath is null)
         {
             return;
         }
@@ -3622,7 +4569,7 @@ public partial class MainViewModel : ObservableObject
         if (error is not null)
         {
             _previewPending = false;
-            StatusText = $"试听写不进 {EapoConfig.FileName}：{error}（改动只在内存里，保存时会再试）";
+            StatusText = $"试听写不进 {ConfigFileName}：{error}（改动只在内存里，保存时会再试）";
             return;
         }
 
@@ -3659,6 +4606,13 @@ public partial class MainViewModel : ObservableObject
             _previewOriginal = original;
             _previewOriginalExisted = existed;
             _previewActive = true;
+        }
+
+        // 试听也同步：Peace 在跑的时候，拖曲线它的推子跟着动。
+        if (!_uiState.IndependentMode)
+        {
+            WriteMixPreset(merged.Points);
+            _peaceSync.Queue(merged.Points, PreAmpDb);
         }
 
         _previewLastText = text;
@@ -3726,7 +4680,7 @@ public partial class MainViewModel : ObservableObject
 
         if (error is not null)
         {
-            StatusText = $"还原 {EapoConfig.FileName} 失败：{error} · 声音可能还停在试听状态";
+            StatusText = $"还原 {ConfigFileName} 失败：{error} · 声音可能还停在试听状态";
             return;
         }
 
@@ -3735,6 +4689,17 @@ public partial class MainViewModel : ObservableObject
         if (!_mainDraft.SavedFlavors.IsFlat)
         {
             await ApplyLiveSettingsAsync(announce: false);
+        }
+
+        // 还原只是把文件写回去，Peace 那边不会自己知道；按勾选状态再对齐一次。
+        if (!_uiState.IndependentMode)
+        {
+            var set = new EqLayerSet(_mainDraft.Saved, _bassDraft.Saved);
+            if (set.TryMerge(IsBassLayerEnabled, Flavors, out var merged, out _))
+            {
+                WriteMixPreset(merged.Points);
+                _peaceSync.Queue(merged.Points, PreAmpDb);
+            }
         }
     }
 
@@ -3789,13 +4754,20 @@ public partial class MainViewModel : ObservableObject
 
         if (error is not null)
         {
-            StatusText = DescribeSaveFailure($"写 {EapoConfig.FileName} 失败", path, error);
+            StatusText = DescribeSaveFailure($"写 {ConfigFileName} 失败", path, error);
             return;
         }
 
         _savedBalance = balance;
         _savedPreAmpDb = preAmp;
         PersistState();
+
+        if (!_uiState.IndependentMode)
+        {
+            WriteMixPreset(merged.Points);
+            _peaceSync.Queue(merged.Points, preAmp);
+        }
+
         RaiseDerived();
         if (announce)
         {
@@ -3819,7 +4791,7 @@ public partial class MainViewModel : ObservableObject
                 return;
             }
 
-            var backup = Path.Combine(UiState.Directory, EapoConfig.FileName + ".bak");
+            var backup = Path.Combine(UiState.Directory, Path.GetFileName(path) + ".bak");
             Directory.CreateDirectory(UiState.Directory);
             File.Copy(path, backup, overwrite: true);
         }
@@ -3835,6 +4807,7 @@ public partial class MainViewModel : ObservableObject
         _spectrumTimer.Stop();
         _liveSaveTimer.Stop();
         _spectrumCapture.Dispose();
+        _peaceSync.Stop();
     }
 
     private void RaiseDraftState()
@@ -3867,10 +4840,15 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(PeaceOverflowHint));
         OnPropertyChanged(nameof(Points));
         OnPropertyChanged(nameof(ReferencePoints));
+        OnPropertyChanged(nameof(GraphPreAmpDb));
+        OnPropertyChanged(nameof(IsPreampEnabled));
         OnPropertyChanged(nameof(BalanceSummary));
         OnPropertyChanged(nameof(BassLayerSummary));
         OnPropertyChanged(nameof(NonPeakingHint));
         OnPropertyChanged(nameof(ConfigDirectory));
+        OnPropertyChanged(nameof(CurveSummary));
+        OnPropertyChanged(nameof(EnvironmentSummary));
+        OnPropertyChanged(nameof(WarningsSummary));
     }
 
     private void Post(Action action)

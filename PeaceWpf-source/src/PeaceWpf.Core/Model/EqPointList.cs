@@ -160,10 +160,51 @@ public sealed class EqPointList : IEquatable<EqPointList>
     }
 
     /// <summary>
-    /// 在指定频率新建一个点。增益 0、Q 1.41、不是端点。
+    /// 在指定频率新建一个点，增益 0。教程和自测用的简写，规则与下面这个重载完全一致。
+    /// </summary>
+    public bool TryAdd(double frequencyHz, out EqPointList list, out EqPoint point) =>
+        TryAdd(frequencyHz, 0, out list, out point);
+
+    /// <summary>
+    /// 找“这个频率属于哪个推子”：只在普通点里找，对数频率距离不超过 <paramref name="maxOctaves"/> 的才算候选，
+    /// 取最近的一个。没有就返回 null —— 调用方据此新建一个。
+    ///
+    /// 端点是频轴的固定地基、没有自己的钟形，抓取只在它们自己的手柄上生效。
+    /// </summary>
+    public EqPoint? NearestWithin(double frequencyHz, double maxOctaves)
+    {
+        if (!double.IsFinite(frequencyHz) || frequencyHz <= 0 || !(maxOctaves > 0))
+        {
+            return null;
+        }
+
+        EqPoint? best = null;
+        var bestDistance = double.MaxValue;
+        foreach (var point in _points)
+        {
+            if (point.IsEndpoint)
+            {
+                continue;
+            }
+
+            var distance = Math.Abs(Math.Log2(frequencyHz / point.FrequencyHz));
+            if (distance > maxOctaves || distance >= bestDistance)
+            {
+                continue;
+            }
+
+            bestDistance = distance;
+            best = point;
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// 在指定频率、指定增益新建一个点，Q 按左右邻居自动挑（见 <see cref="SuggestQuality"/>）。
     /// 只拒绝“与已有点太近”；点数不设上限。
     /// </summary>
-    public bool TryAdd(double frequencyHz, out EqPointList list, out EqPoint point)
+    public bool TryAdd(double frequencyHz, double gainDb, out EqPointList list, out EqPoint point)
     {
         list = this;
         point = null!;
@@ -182,11 +223,58 @@ public sealed class EqPointList : IEquatable<EqPointList>
             }
         }
 
-        var created = new EqPoint(NextId, hz, 0, EqLimits.DefaultQuality, false);
+        var created = new EqPoint(NextId, hz, ClampGain(gainDb), SuggestQuality(hz), false);
         var array = _points.Append(created).OrderBy(item => item.FrequencyHz).ToArray();
         list = new EqPointList(array);
         point = created;
         return true;
+    }
+
+    /// <summary>
+    /// 给新点挑 Q：让钟形的半功率点正好落在最近的那个邻居身上 ——
+    /// 旁边挤就窄，空地就宽。夹在 <see cref="EqLimits.MinAutoQuality"/>–<see cref="EqLimits.MaxAutoQuality"/> 之间，
+    /// 免得一个点糊满半个频段，或者细成一根针。
+    ///
+    /// 换算用的是峰值滤波器自己的带宽关系：Q = √(2ⁿ) / (2ⁿ − 1)，n 是倍频程带宽。
+    /// </summary>
+    private double SuggestQuality(double frequencyHz)
+    {
+        var previous = 0.0;
+        var next = double.MaxValue;
+        foreach (var existing in _points)
+        {
+            if (existing.FrequencyHz < frequencyHz)
+            {
+                previous = Math.Max(previous, existing.FrequencyHz);
+            }
+            else if (existing.FrequencyHz > frequencyHz)
+            {
+                next = Math.Min(next, existing.FrequencyHz);
+            }
+        }
+
+        // 两侧的空隙，取窄的那一边：钟形只是不该压到最近的邻居，远的那侧不用管。
+        var gapOctaves = double.MaxValue;
+        if (previous > 0)
+        {
+            gapOctaves = Math.Min(gapOctaves, Math.Log2(frequencyHz / previous));
+        }
+
+        if (next < double.MaxValue)
+        {
+            gapOctaves = Math.Min(gapOctaves, Math.Log2(next / frequencyHz));
+        }
+
+        if (!double.IsFinite(gapOctaves) || gapOctaves <= 0)
+        {
+            return EqLimits.DefaultQuality;
+        }
+
+        // 半功率点落在邻居身上，所以整条带宽是两边空隙之和 —— 这里按窄的那侧翻倍算。
+        var octaves = Math.Clamp(gapOctaves * 2, 1e-6, 12);
+        var ratio = Math.Pow(2, octaves);
+        var quality = Math.Sqrt(ratio) / (ratio - 1);
+        return Math.Clamp(quality, EqLimits.MinAutoQuality, EqLimits.MaxAutoQuality);
     }
 
     /// <summary>删掉一个点。端点和“只剩两个点”的情况都拒绝，返回 null。</summary>

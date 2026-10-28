@@ -31,6 +31,15 @@ public static class SweepMeasureService
     /// <summary>开播之前先录多久的环境声（毫秒）。</summary>
     private const int NoiseFloorMs = 500;
 
+    /// <summary>
+    /// 丢掉开设备杂音之后，再录多久干净的环境声（毫秒）。
+    ///
+    /// 这一段是每个频点自己的噪声底（见 SweepAnalyzer 的分带噪声底）唯一的干净参考：
+    /// 前面那 <see cref="NoiseFloorMs"/> 里混着刚打开设备时的杂音，已经整段丢掉了。
+    /// 太短的话低频凑不够整周期；300 ms 在 20 Hz 上也有 6 个周期。
+    /// </summary>
+    private const int PreRollMs = 300;
+
     /// <summary>播完再多录多久（毫秒），把混响尾巴和缓冲里剩下的声音收进来。</summary>
     private const int TailMs = 600;
 
@@ -59,6 +68,7 @@ public static class SweepMeasureService
         List<MeasurementPoint>? liveSink = null)
     {
         var plan = frequencies ?? SweepPlan.Frequencies;
+        var schedule = SweepSchedule.Build(plan, SweepTiming.ForEngine(SweepAnalyzer.Engine));
         using var microphone = new MicrophoneCaptureService();
         using var player = new ToneSweepPlayer();
 
@@ -80,25 +90,25 @@ public static class SweepMeasureService
         await Task.Delay(NoiseFloorMs, token).ConfigureAwait(false);
         microphone.TakeSamples();
 
+        // 再录一小段干净的环境声。这一段留在缓冲里，分析时当噪声参考用。
+        await Task.Delay(PreRollMs, token).ConfigureAwait(false);
+
         progress?.Report(new SweepProgress(0, "开始扫频…", MeasureLevel(microphone)));
 
-        if (!player.Start(plan))
+        if (!player.Start(schedule))
         {
             throw new InvalidOperationException(
                 "输出设备打不开：" + (player.LastError ?? "系统里没有可用的播放设备。"));
         }
 
-        var totalMs = SweepPlan.TotalMsFor(plan.Count);
-        var timeout = totalMs + PlaybackTimeoutMs;
+        var totalMs = schedule.TotalMs;
+        var timeout = (int)Math.Ceiling(totalMs) + PlaybackTimeoutMs;
         var waited = 0;
 
-        // 实时曲线：从同步音结束的位置起，按固定节奏一段一段量，测到哪画到哪。
-        // 这里用的是「标称」起点（同步音 + 间隔），没扣系统延迟——预览会差几十毫秒，
-        // 但形状是对的；最终结果仍然由 Analyze 用同步音对齐后重算。
-        var originSample = (int)((long)sampleRate * (SweepPlan.SyncMs + SweepPlan.SyncGapMs) / 1000);
-        var blockSamples = Math.Max(1, (int)((long)sampleRate * SweepPlan.BlockMs / 1000));
-        var measureSkip = sampleRate * SweepPlan.MeasureSkipMs / 1000;
-        var measureLength = (sampleRate * SweepPlan.MeasureEndMs / 1000) - measureSkip;
+        // 实时曲线：从同步音结束的位置起，按时间表一段一段量，测到哪画到哪。
+        // 这里用的是「标称」起点（前导 + 同步音 + 间隔），没扣系统延迟和每块的局部对齐——
+        // 预览会差几十毫秒，但形状是对的；最终结果仍然由分析器用同步音对齐后重算。
+        var originSample = (int)((long)sampleRate * (PreRollMs + SweepPlan.SyncMs + SweepPlan.SyncGapMs) / 1000);
         var live = liveSink ?? new List<MeasurementPoint>(plan.Count);
         var lastBlock = 0;
 
@@ -110,17 +120,34 @@ public static class SweepMeasureService
             var fraction = Math.Clamp(player.ElapsedMs / totalMs, 0, 0.98);
 
             var recorded = microphone.SampleCount;
-            var complete = Math.Min(plan.Count, (recorded - originSample) / blockSamples);
+            var complete = lastBlock;
+            while (complete < schedule.Blocks.Count)
+            {
+                var block = schedule.Blocks[complete];
+
+                // 必须把块起点算进去：只加窗尾的话，第一个频点一录完，后面每个块的条件会同时成立，
+                // 实时曲线会在 1 秒左右一次性画满、然后一动不动。
+                var blockEnd = originSample + block.StartSample(sampleRate) + block.MeasureEndSample(sampleRate);
+                if (recorded < blockEnd)
+                {
+                    break;
+                }
+
+                complete++;
+            }
+
             if (complete > lastBlock)
             {
                 for (var i = lastBlock; i < complete; i++)
                 {
-                    var start = originSample + (i * blockSamples) + measureSkip;
+                    var block = schedule.Blocks[i];
+                    var start = originSample + block.StartSample(sampleRate) + block.MeasureStartSample(sampleRate);
+                    var length = block.MeasureEndSample(sampleRate) - block.MeasureStartSample(sampleRate);
 
                     // SnrDb 给个够用的值：这是「已经录到的信号」，不是「信噪比算出来的」。
                     // 填 0 的话，Fit 会把它当成不可用点，整条实时拟合直接抛异常。
-                    var raw = microphone.WindowRmsDb(start, measureLength);
-                    var point = new MeasurementPoint(plan[i], raw, 12, raw);
+                    var raw = microphone.WindowRmsDb(start, length);
+                    var point = new MeasurementPoint(block.FrequencyHz, raw, 12, raw);
 
                     // 跨轮共用同一份列表：这一轮扫到哪就覆盖到哪，没扫到的保持上一轮的值。
                     // 这样界面上的实测线不会在每轮开头缩回去重新长。
@@ -163,8 +190,8 @@ public static class SweepMeasureService
         var measurement = await Task.Run(
             () =>
             {
-                var result = SweepAnalyzer.Analyze(samples, sampleRate, out var analyzeError, plan);
-                DumpDiagnostics(samples, sampleRate, result, analyzeError);
+                var result = SweepAnalyzer.AnalyzeAuto(samples, sampleRate, out var analyzeError, plan, schedule);
+                DumpDiagnostics(samples, sampleRate, result, analyzeError, plan, schedule);
                 return result ?? throw new InvalidOperationException(analyzeError ?? "分析失败。");
             },
             token).ConfigureAwait(false);
@@ -314,8 +341,15 @@ public static class SweepMeasureService
         return diffs[Math.Min(index, diffs.Length - 1)] <= stabilityDb;
     }
 
-    /// <summary>每个频点取各轮的中位数。偶数轮取中间偏后的那个，不做平均（平均会被一个坏值拖走）。</summary>
-    private static SweepMeasurement Merge(IReadOnlyList<SweepMeasurement> results)
+    /// <summary>
+    /// 合并多遍：每个频点取中位数，但先剔掉明显跑偏的那一遍。
+    ///
+    /// 中位数本身只抗一个离群值，而且两遍时它退化成平均——标准档正好是两遍，
+    /// 一遍里混进一声敲门，整个频点就被拖走。所以先用中位绝对偏差（MAD）圈出可信的那几遍：
+    /// 偏离超过 max(6 dB, 3×1.4826×MAD) 的丢掉。两遍且差得远时算不出 MAD，就按纯度选；
+    /// 纯度也分不出来时取较低的那个——干扰只会把读数抬高，不会压低。
+    /// </summary>
+    public static SweepMeasurement Merge(IReadOnlyList<SweepMeasurement> results)
     {
         var first = results[0];
         var points = new List<MeasurementPoint>(first.Points.Count);
@@ -325,6 +359,8 @@ public static class SweepMeasureService
             var raws = new double[results.Count];
             var snrs = new double[results.Count];
             var levels = new double[results.Count];
+            var purities = new double[results.Count];
+            var offsets = new double[results.Count];
 
             for (var r = 0; r < results.Count; r++)
             {
@@ -332,27 +368,137 @@ public static class SweepMeasureService
                 raws[r] = point.RawDb;
                 snrs[r] = point.SnrDb;
                 levels[r] = point.LevelDb;
+                purities[r] = point.PurityDb;
+                offsets[r] = point.AlignOffsetMs;
             }
 
-            Array.Sort(raws);
-            Array.Sort(snrs);
-            Array.Sort(levels);
-            var mid = results.Count / 2;
+            var keep = KeepIndexes(levels, purities);
 
             points.Add(new MeasurementPoint(
                 first.Points[i].FrequencyHz,
-                levels[mid],
-                snrs[mid],
-                raws[mid]));
+                MedianOf(levels, keep),
+                MedianOf(snrs, keep),
+                MedianOf(raws, keep))
+            {
+                PurityDb = MedianOf(purities, keep),
+                AlignOffsetMs = MedianOf(offsets, keep),
+            });
         }
 
         var noiseFloors = results.Select(result => result.NoiseFloorDb).OrderBy(value => value).ToArray();
+
+        double[]? perPointFloors = null;
+        if (results.All(result => result.NoiseFloorsDb is { Count: > 0 }))
+        {
+            perPointFloors = new double[first.Points.Count];
+            for (var i = 0; i < perPointFloors.Length; i++)
+            {
+                var values = results
+                    .Select(result => result.NoiseFloorsDb![i])
+                    .OrderBy(value => value)
+                    .ToArray();
+                perPointFloors[i] = values[values.Length / 2];
+            }
+        }
 
         return new SweepMeasurement(
             points,
             noiseFloors[noiseFloors.Length / 2],
             first.SampleRate,
-            first.Frequencies);
+            first.Frequencies)
+        {
+            NoiseFloorsDb = perPointFloors,
+            EngineName = first.EngineName,
+        };
+    }
+
+    /// <summary>哪些遍可信。见 <see cref="Merge"/> 的说明。</summary>
+    private static bool[] KeepIndexes(double[] levels, double[] purities)
+    {
+        var count = levels.Length;
+        var keep = new bool[count];
+        if (count == 0)
+        {
+            return keep;
+        }
+
+        if (count == 1)
+        {
+            keep[0] = true;
+            return keep;
+        }
+
+        if (count == 2)
+        {
+            if (Math.Abs(levels[0] - levels[1]) <= 6)
+            {
+                keep[0] = true;
+                keep[1] = true;
+                return keep;
+            }
+
+            var firstPurity = double.IsNaN(purities[0]) ? 0 : purities[0];
+            var secondPurity = double.IsNaN(purities[1]) ? 0 : purities[1];
+            var pick = Math.Abs(firstPurity - secondPurity) < 1.0
+                ? (levels[0] <= levels[1] ? 0 : 1)
+                : (firstPurity >= secondPurity ? 0 : 1);
+
+            keep[pick] = true;
+            return keep;
+        }
+
+        var sorted = (double[])levels.Clone();
+        Array.Sort(sorted);
+        var median = sorted[count / 2];
+
+        var deviations = new double[count];
+        for (var i = 0; i < count; i++)
+        {
+            deviations[i] = Math.Abs(levels[i] - median);
+        }
+
+        Array.Sort(deviations);
+        var mad = deviations[count / 2];
+        var limit = Math.Max(6.0, 3.0 * 1.4826 * mad);
+
+        var kept = 0;
+        for (var i = 0; i < count; i++)
+        {
+            if (Math.Abs(levels[i] - median) <= limit)
+            {
+                keep[i] = true;
+                kept++;
+            }
+        }
+
+        // 全都被判成离群时不能空手回去——那说明这一段的离散是真实的，取中位那份。
+        if (kept == 0)
+        {
+            keep[count / 2] = true;
+        }
+
+        return keep;
+    }
+
+    /// <summary>只对保留下来的那几遍取中位；NaN 排在前面，纯度和对齐偏移全 NaN 时结果还是 NaN。</summary>
+    private static double MedianOf(double[] values, bool[] keep)
+    {
+        var kept = new List<double>(values.Length);
+        for (var i = 0; i < values.Length; i++)
+        {
+            if (keep[i])
+            {
+                kept.Add(values[i]);
+            }
+        }
+
+        if (kept.Count == 0)
+        {
+            kept.AddRange(values);
+        }
+
+        kept.Sort();
+        return kept[kept.Count / 2];
     }
 
     /// <summary>实时电平：只看最近一小段，不清空缓冲——缓冲里是等下要分析的数据。</summary>
@@ -360,27 +506,38 @@ public static class SweepMeasureService
         microphone.RecentLevelDb();
 
     /// <summary>
-    /// 把这次测量的原始数字写到 %LOCALAPPDATA%\PeaceWpf\sweep-last.txt。
+    /// 把这次测量的原始数字写到 %LOCALAPPDATA%\EasyEQ\sweep-last.txt。
     ///
     /// 界面只显示「可用频点 N/61」，看不出问题出在噪声底、段错位，还是某个频段真的没声音。
-    /// 这里按固定 380 ms 网格把每个频点的「响声窗」和「间隙窗」都记下来，事后能直接对账。
+    /// 这里按当轮时间表把每个频点的电平、纯度、对齐偏移、各自的噪声底都记下来，
+    /// 再用同一段录音跑另一套引擎做逐点对比——新旧差多少，一次测量就看得到。
     /// </summary>
-    private static void DumpDiagnostics(float[] samples, int sampleRate, SweepMeasurement? measurement, string? error)
+    private static void DumpDiagnostics(
+        float[] samples,
+        int sampleRate,
+        SweepMeasurement? measurement,
+        string? error,
+        IReadOnlyList<double> frequencies,
+        SweepSchedule schedule)
     {
         try
         {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PeaceWpf");
+            var dir = AppPaths.DataDirectory;
             Directory.CreateDirectory(dir);
 
             var sb = new StringBuilder();
             var durationMs = samples.Length * 1000.0 / Math.Max(1, sampleRate);
             sb.AppendLine($"# 录音 {samples.Length} 样本 / {sampleRate} Hz / {durationMs:0} ms");
             sb.AppendLine($"# error={error ?? "-"}");
+            sb.AppendLine(
+                $"# engine={SweepAnalyzer.EngineLabel(SweepAnalyzer.Engine)}"
+                + $" timing={schedule.Timing.Name} uniform={schedule.IsUniform} total={schedule.TotalMs:0} ms");
             if (measurement is not null)
             {
-                sb.AppendLine($"# noiseFloor={measurement.NoiseFloorDb:0.0} dBFS  usable={measurement.UsableCount}/{measurement.Points.Count}");
+                sb.AppendLine(
+                    $"# noiseFloor={measurement.NoiseFloorDb:0.0} dBFS"
+                    + $" usable={measurement.UsableCount}/{measurement.Points.Count}"
+                    + $" dirty={measurement.DirtyCount}");
             }
 
             // 每 20 ms 一帧的整段电平。这是最直接的证据：响声和静音有没有排开，一眼就能看出来。
@@ -401,18 +558,89 @@ public static class SweepMeasureService
             if (measurement is not null)
             {
                 sb.AppendLine();
-                sb.AppendLine("hz,raw_db,snr_db,level_db");
-                foreach (var point in measurement.Points)
+                sb.AppendLine("hz,raw_db,snr_db,level_db,purity_db,align_ms,noise_db");
+                for (var i = 0; i < measurement.Points.Count; i++)
                 {
-                    sb.AppendLine($"{point.FrequencyHz:0.0},{point.RawDb:0.0},{point.SnrDb:0.0},{point.LevelDb:0.0}");
+                    var point = measurement.Points[i];
+                    var floor = measurement.NoiseFloorsDb is { } floors && i < floors.Count
+                        ? floors[i]
+                        : point.RawDb - point.SnrDb;
+                    sb.AppendLine(
+                        $"{point.FrequencyHz:0.0},{point.RawDb:0.00},{point.SnrDb:0.00},{point.LevelDb:0.00},"
+                        + $"{point.PurityDb:0.00},{point.AlignOffsetMs:0.00},{floor:0.00}");
                 }
             }
+
+            AppendEngineComparison(sb, samples, sampleRate, measurement, frequencies, schedule);
 
             File.WriteAllText(Path.Combine(dir, "sweep-last.txt"), sb.ToString());
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // 诊断写不出来不该把测量拖失败。
+        }
+    }
+
+    /// <summary>
+    /// 同一段录音再用另一套引擎跑一遍，逐点列出差多少。
+    ///
+    /// 只在均匀时间表上做：旧引擎按固定 380 ms 网格分段，低频加长之后它会对不上，
+    /// 那种情况下拿它来对比是错的，不如不写。
+    /// </summary>
+    private static void AppendEngineComparison(
+        StringBuilder sb,
+        float[] samples,
+        int sampleRate,
+        SweepMeasurement? measurement,
+        IReadOnlyList<double> frequencies,
+        SweepSchedule schedule)
+    {
+        if (measurement is null || measurement.Points.Count == 0)
+        {
+            return;
+        }
+
+        if (!schedule.IsUniform)
+        {
+            // 时间表不相等时，旧引擎按固定 380 ms 网格对不上块，整段重算没有意义。
+            // 但同一批窗口还能比：宽带 RMS 就在纯度的分母里（raw − 纯度 = 同窗 RMS），
+            // 这一列量的是「换成旧办法量同一个窗，会读高多少」。
+            sb.AppendLine();
+            sb.AppendLine("# 对比：同一个测量窗的宽带 RMS（不是旧引擎整段重算）");
+            sb.AppendLine("hz,level_db,rms_level_db,delta_db,purity_db");
+            foreach (var point in measurement.Points)
+            {
+                if (!double.IsFinite(point.PurityDb))
+                {
+                    continue;
+                }
+
+                var rms = point.LevelDb - point.PurityDb;
+                sb.AppendLine(
+                    $"{point.FrequencyHz:0.0},{point.LevelDb:0.00},{rms:0.00},{rms - point.LevelDb:0.00},{point.PurityDb:0.00}");
+            }
+
+            return;
+        }
+
+        var otherIsLegacy = SweepAnalyzer.Engine == SweepEngine.Coherent;
+        var reference = otherIsLegacy
+            ? SweepAnalyzer.Analyze(samples, sampleRate, out _, frequencies)
+            : SweepAnalyzer.AnalyzeCoherent(samples, sampleRate, out _, frequencies, schedule);
+
+        if (reference is null || reference.Points.Count != measurement.Points.Count)
+        {
+            return;
+        }
+
+        sb.AppendLine();
+        sb.AppendLine($"# 对比：同一段录音跑{(otherIsLegacy ? "宽带 RMS" : "单频相干")}");
+        sb.AppendLine("hz,level_db,other_level_db,delta_db");
+        for (var i = 0; i < measurement.Points.Count; i++)
+        {
+            var current = measurement.Points[i].LevelDb;
+            var other = reference.Points[i].LevelDb;
+            sb.AppendLine($"{measurement.Points[i].FrequencyHz:0.0},{current:0.00},{other:0.00},{current - other:0.00}");
         }
     }
 }

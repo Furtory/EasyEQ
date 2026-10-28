@@ -1,124 +1,108 @@
 using PeaceWpf.Core.Audio;
-using PeaceWpf.Core.Calibration;
 using PeaceWpf.Core.Dsp;
 using PeaceWpf.Core.Model;
 
 namespace PeaceWpf;
 
 /// <summary>
-/// 教程里「自动EQ → 自定义矫正起点」那一段的模拟数据。
+/// 教程里「自动EQ」那几步的演示实测。
 ///
-/// 曲线不另画一套：喂一份固定的模拟实测给 <see cref="EqCurveFitter"/>，
-/// 由主程序同一个拟合器算出配点，再用 <see cref="EqResponse.GainAt"/> 求值——
-/// 和自动EQ 窗口里画的是同一套算法，只是实测是写死的。
-/// 拖动起点时在相邻两份结果之间插值，所以线会跟着变，又不用每帧跑一遍解方程。
+/// 两条曲线都是现成的预设：左右用 0（<c>0.peace</c>），低音用 1（<c>1.peace</c>），
+/// 推子原样抄在源码里当常量，运行时不读任何 <c>.peace</c> 文件：
+/// 教程不该因为用户删了、改了预设就变样。
+///
+/// 自动EQ 窗口只吃一份「实测」，所以把两份预设拼成一条：
+/// 100 Hz 以下取低音预设的反相，100 Hz 以上取左右预设的反相（目标平直时，实测 + 校正 = 0）。
+/// 于是真实窗口用自己的拟合器算出来，上面就是 0 号那条、下面就是 1 号那条。
 /// </summary>
 internal static class TutorialCalibrationDemo
 {
     /// <summary>演示的频段上限：和自动EQ 图的横轴一致。</summary>
-    public const double MaxFrequency = 16000;
+    public const double MaxFrequency = 20000;
 
-    /// <summary>预先算好的几个矫正起点（Hz）。拖动时在这几个之间插值。</summary>
-    private static readonly double[] Floors = { 80, 110, 150, 200, 260, 320 };
+    /// <summary>两份预设拼接的位置，和自动EQ 的默认矫正起点一致。</summary>
+    private const double SplitHz = 100;
 
-    private static readonly Lazy<SweepMeasurement> Measurement = new(BuildMeasurement);
-    private static readonly Lazy<Dictionary<double, PeaceSnapshot>> Plans = new(BuildPlans);
-
-    /// <summary>模拟实测：几个宽窄不一的凹陷和隆起，够演示「起点一变，补的地方就变」。</summary>
-    public static double MeasuredGain(double hz)
+    /// <summary>
+    /// 左右（<c>0.peace</c>）的九段推子。那份的 <c>[Filters]</c> 是空的，所以全是 PK。
+    /// </summary>
+    private static readonly double[] MainFrequencies =
     {
-        var log = Math.Log10(Math.Max(20, hz) / 20);
-        var dip150 = -5.5 * Math.Exp(-0.5 * Math.Pow((log - Math.Log10(150 / 20.0)) / 0.05, 2));
-        var bump1200 = 3.2 * Math.Exp(-0.5 * Math.Pow((log - Math.Log10(1200 / 20.0)) / 0.07, 2));
-        var dip3200 = -6.0 * Math.Exp(-0.5 * Math.Pow((log - Math.Log10(3200 / 20.0)) / 0.06, 2));
-        var dip8000 = -4.0 * Math.Exp(-0.5 * Math.Pow((log - Math.Log10(8000 / 20.0)) / 0.10, 2));
-        return dip150 + bump1200 + dip3200 + dip8000;
-    }
+        20, 43, 97, 369, 856, 2421, 7069, 12667, 20000,
+    };
 
-    /// <summary>主层校正：矫正起点以上由拟合器给出，起点以下保持 0（交给低音层）。</summary>
-    public static double CorrectionGain(double floorHz, double hz)
+    private static readonly double[] MainGains =
     {
-        var plans = Plans.Value;
-        if (plans.Count == 0)
+        0.1, -0.1, -0.5, 7.5, 4.3, -5.1, -2.2, 4.2, 5.9,
+    };
+
+    private static readonly double[] MainQualities =
+    {
+        0.61, 0.53, 1.41, 0.93, 0.93, 1.41, 1.07, 0.53, 0.3,
+    };
+
+    /// <summary>低音（<c>1.peace</c>）的四段推子；最后一段是 20 kHz 端点，增益 0。</summary>
+    private static readonly double[] BassFrequencies =
+    {
+        20, 50, 106, 20000,
+    };
+
+    private static readonly double[] BassGains =
+    {
+        4.5, 7.1, -3.1, 0.0,
+    };
+
+    private static readonly double[] BassQualities =
+    {
+        0.81, 0.46, 0.61, 1.41,
+    };
+
+    private static readonly Lazy<SweepMeasurement> Measurement = new(CreateMeasurement);
+
+    /// <summary>演示用的实测：低音段取 1 号预设的反相，其余取 0 号的反相。</summary>
+    public static SweepMeasurement BuildMeasurement() => Measurement.Value;
+
+    private static PeaceSnapshot BuildPreset(
+        double[] frequencies, double[] gains, double[] qualities)
+    {
+        var bands = new List<SliderBand>(frequencies.Length);
+        for (var i = 0; i < frequencies.Length; i++)
         {
-            return 0;
+            bands.Add(new SliderBand(
+                i,
+                frequencies[i],
+                gains[i],
+                qualities[i],
+                EqLimits.PeakingFilter,
+                true));
         }
 
-        var (lower, upper, t) = Bracket(floorHz);
-        var low = Evaluate(plans, lower, hz);
-        var high = Evaluate(plans, upper, hz);
-        return low + (high - low) * t;
+        return new PeaceSnapshot(bands, 0, bands.Count);
     }
 
-    /// <summary>低音层：起点以下按实测反相补回去；起点以上不画。</summary>
-    public static double BassGain(double floorHz, double hz) =>
-        hz <= floorHz ? -MeasuredGain(hz) : 0;
-
-    private static double Evaluate(Dictionary<double, PeaceSnapshot> plans, double floor, double hz) =>
-        plans.TryGetValue(floor, out var snapshot) ? EqResponse.GainAt(snapshot, hz) : 0;
-
-    /// <summary>找到夹住这个起点的两份预计算结果。</summary>
-    private static (double Lower, double Upper, double T) Bracket(double floorHz)
+    private static SweepMeasurement CreateMeasurement()
     {
-        floorHz = Math.Clamp(floorHz, Floors[0], Floors[^1]);
-        for (var i = 0; i < Floors.Length - 1; i++)
-        {
-            if (floorHz > Floors[i + 1])
-            {
-                continue;
-            }
+        var main = BuildPreset(MainFrequencies, MainGains, MainQualities);
+        var bass = BuildPreset(BassFrequencies, BassGains, BassQualities);
 
-            var span = Floors[i + 1] - Floors[i];
-            var t = span <= 0 ? 0 : (floorHz - Floors[i]) / span;
-            return (Floors[i], Floors[i + 1], t);
-        }
-
-        return (Floors[^1], Floors[^1], 0);
-    }
-
-    private static SweepMeasurement BuildMeasurement()
-    {
         var points = new List<MeasurementPoint>();
         var frequencies = new List<double>();
-        for (var i = 0; i <= 160; i++)
+        for (var i = 0; i <= 180; i++)
         {
-            var hz = 20 * Math.Pow(1000, i / 160.0);
+            var hz = 20 * Math.Pow(1000, i / 180.0);
             if (hz > MaxFrequency)
             {
                 break;
             }
 
-            points.Add(new MeasurementPoint(hz, MeasuredGain(hz), 40, MeasuredGain(hz) - 30));
+            var correction = hz < SplitHz
+                ? EqResponse.GainAt(bass, hz)
+                : EqResponse.GainAt(main, hz);
+
+            points.Add(new MeasurementPoint(hz, -correction, 40, -correction));
             frequencies.Add(hz);
         }
 
         return new SweepMeasurement(points, -90, 48000, frequencies);
-    }
-
-    private static Dictionary<double, PeaceSnapshot> BuildPlans()
-    {
-        var map = new Dictionary<double, PeaceSnapshot>();
-        var measurement = Measurement.Value;
-        foreach (var floor in Floors)
-        {
-            try
-            {
-                var plan = EqCurveFitter.Fit(
-                    CalibrationTargetKind.Flat,
-                    measurement,
-                    targetOffsetDb: null,
-                    density: FitDensity.Normal,
-                    baselineEq: null,
-                    movableBands: false,
-                    floorHz: floor);
-                map[floor] = plan.Points.ToSnapshot();
-            }
-            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
-            {
-                // 这份模拟实测拟合不出来就留空，演示退化成平线，不会让教程崩。
-            }
-        }
-
-        return map;
     }
 }

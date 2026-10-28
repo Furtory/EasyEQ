@@ -40,25 +40,17 @@ public sealed record TutorialStep(
     bool PreampDemo = false,
     bool BassCurvePreview = false,
     bool FlavorDemo = false,
-    bool CrossoverDemo = false);
+    bool CrossoverDemo = false,
+    bool BoostDemo = false);
 
 /// <summary>
-/// 两套课程的步骤表。基础课会依次打开设置、预设EQ、自动EQ 三个功能窗口，
+/// 两套课程的步骤表。基础课会依次打开预设EQ、自动EQ 两个功能窗口，
 /// 气泡跟进去继续指窗口里的控件；进阶课都在主窗口里完成。
 /// </summary>
 public static class TutorialSteps
 {
     private static readonly TutorialStep[] Basic =
     {
-        new(TutorialWindowKind.Main, "SettingsButton", "先看设置",
-            "点齿轮打开设置：左栏管运行环境，中栏管使用习惯，右栏是软件本身。", TutorialBubblePlacement.Bottom),
-
-        new(TutorialWindowKind.Settings, "SettingsStatus", "状态与提示",
-            "这里会说没接 APO、目录不可写，或者文件被占用；「复制状态」可以把整段带走。",
-            TutorialBubblePlacement.Bottom),
-        new(TutorialWindowKind.Settings, "SettingsConfigFolder", "配置文件夹",
-            "所有 .peace 预设都在这个文件夹里；路径不对就在这里重新选。", TutorialBubblePlacement.Bottom),
-
         new(TutorialWindowKind.Main, "AutoEqButton", "预设EQ",
             "按耳机型号套一份现成校正，只替换左右层。", TutorialBubblePlacement.Bottom),
         new(TutorialWindowKind.PresetEq, "AutoEqSearchBox", "搜型号",
@@ -79,9 +71,13 @@ public static class TutorialSteps
             "快速一轮约 30 秒、标准两轮约 2 分钟、更准三轮约 5 分钟；先选好档位，再开始测量。",
             TutorialBubblePlacement.Bottom),
         new(TutorialWindowKind.AutoCalibrate, "CalibratePlot", "自定义矫正起点",
-            "图上那条黄色虚线就是矫正起点：往上由「左右」层拟合，往下交给低音层。"
+            "图上那条黄色虚线就是矫正起点：往上交给「左右」层，往下交给低音层。"
             + "按住它左右拖，两层会按同一份实测重算，不用重测。",
             TutorialBubblePlacement.TopRight, CrossoverDemo: true),
+        new(TutorialWindowKind.AutoCalibrate, "CalibrateBoostSlider", "科学矫正",
+            "左下角这条滑杆是「补得准」和「留音量」的取舍：往左贴合目标，但整条曲线连着音量一起压下去；"
+            + "拉到中间只切不补，音量最满、不削波；再往右把提升放回来，超过 0 dBFS 的部分就削掉了。",
+            TutorialBubblePlacement.Top, BoostDemo: true),
         new(TutorialWindowKind.AutoCalibrate, "CalibrateStartButton", "开始测量",
             "音量调到平时位置，点下去等二十多秒到几分钟。", TutorialBubblePlacement.Bottom),
         new(TutorialWindowKind.AutoCalibrate, "CalibrateApplyButton", "套用",
@@ -96,7 +92,7 @@ public static class TutorialSteps
         new(TutorialWindowKind.Main, "ModeMain", "进入左右编辑",
             "点「左右」进入左右层；教程已经替你切好，这层改的是左右声道的曲线。", TutorialBubblePlacement.Right),
         new(TutorialWindowKind.Main, "EqGraph", "自定义曲线",
-            "点空白建点，上下拖改增益、左右拖改频率；滚轮改 Q，右键删点，Ctrl+Z 撤回。下面是真实曲线上的演示。",
+            "按住曲线拖动，抓的就是频率最近的那颗推子，曲线始终经过鼠标；空白处按下就在鼠标处建点（Q 按邻居自动定）。滚轮改 Q，右键普通点删除、首尾端点归零，Ctrl+Z 撤回。下面是真实曲线上的演示。",
             TutorialBubblePlacement.TopRight, RealCurveDemo: true),
         new(TutorialWindowKind.Main, "SweepButton", "听左右曲线",
             "点「扫频」：先听没改过的平直曲线，再听刚才改过的左右曲线，走的都是软件自己的扫频。",
@@ -118,6 +114,9 @@ public static class TutorialSteps
             "八种目标声音都在这个下拉里：选一个（比如脚步），把它的手柄在图上上下拖；右键手柄就还原成 0 dB。"
             + "风味只叠加，不改你的左右 / 低音曲线。",
             TutorialBubblePlacement.Left, FlavorDemo: true),
+        new(TutorialWindowKind.Main, "AutoSwitchButton", "自动切换",
+            "支持使用热键切换组合，还可以自动根据软件切换组合。",
+            TutorialBubblePlacement.Bottom),
     };
 
     public static IReadOnlyList<TutorialStep> For(TutorialCourse course) =>

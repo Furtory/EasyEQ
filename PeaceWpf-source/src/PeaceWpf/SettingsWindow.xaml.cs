@@ -21,12 +21,22 @@ public partial class SettingsWindow : FluentWindow
 
     private bool _loadingShowOnStart;
 
+    /// <summary>初始化独立模式开关时，别把「设值」当成「用户点击」。</summary>
+    private bool _loadingIndependentMode;
+
+    /// <summary>初始化退出行为单选框时，别把「设值」当成「用户点击」。</summary>
+    private bool _loadingCloseAction;
+
     public SettingsWindow(MainViewModel viewModel)
     {
         _viewModel = viewModel;
         InitializeComponent();
         DataContext = viewModel;
         Loaded += OnLoaded;
+
+        // 托盘菜单里也能开/关开机自启；切回设置窗口时重新读一遍，
+        // 别让这边的开关跟注册表里的真实状态对不上。
+        Activated += (_, _) => RefreshAutoStartSwitch();
 
         // 尺寸钉死之后没有可拉的边框，顶部留一条能按住拖窗口
         WindowDragHelper.Enable(this);
@@ -37,14 +47,27 @@ public partial class SettingsWindow : FluentWindow
         VersionText.Text = "v" + AppInfo.Version;
         UpdateStatusText.Text = "点一下看看有没有新版本。";
         RefreshApoInstallText();
-
-        _loadingAutoStart = true;
-        AutoStartSwitch.IsChecked = AutoStart.IsEnabled;
-        _loadingAutoStart = false;
-
+        RefreshAutoStartSwitch();
         _loadingShowOnStart = true;
         ShowOnStartSwitch.IsChecked = _viewModel.ShowWindowOnStart;
         _loadingShowOnStart = false;
+
+        _loadingIndependentMode = true;
+        IndependentModeSwitch.IsChecked = _viewModel.IndependentMode;
+        _loadingIndependentMode = false;
+
+        _loadingCloseAction = true;
+        CloseExitRadio.IsChecked = _viewModel.CloseAction == CloseAction.Exit;
+        CloseTrayRadio.IsChecked = _viewModel.CloseAction == CloseAction.MinimizeToTray;
+        _loadingCloseAction = false;
+    }
+
+    /// <summary>开机自启开关的真实状态：托盘菜单也能改，所以窗口每次激活都重读一遍。</summary>
+    private void RefreshAutoStartSwitch()
+    {
+        _loadingAutoStart = true;
+        AutoStartSwitch.IsChecked = AutoStart.IsEnabled;
+        _loadingAutoStart = false;
     }
 
     /// <summary>安装状态那一行：能读到版本就报版本，读不到就是未检测到。</summary>
@@ -108,7 +131,7 @@ public partial class SettingsWindow : FluentWindow
             return;
         }
 
-        _viewModel.StatusText = "安装向导已打开：按它走完，再回来点「重新检查并连接」。";
+        _viewModel.StatusText = "安装向导已打开：按它走完，再回来点「重新连接」。";
     }
 
     /// <summary>重新检查；发现找到目录但没接上时，顺手接上。</summary>
@@ -213,6 +236,71 @@ public partial class SettingsWindow : FluentWindow
         }
 
         _viewModel.ShowWindowOnStart = false;
+    }
+
+    /// <summary>
+    /// 退出行为：在设置里选一次就等于「记住选择」，之后点关闭不再问。
+    /// </summary>
+    private void OnCloseExitChecked(object sender, RoutedEventArgs e)
+    {
+        if (_loadingCloseAction)
+        {
+            return;
+        }
+
+        _viewModel.CloseAction = CloseAction.Exit;
+        _viewModel.StatusText = "关闭窗口时退出软件。";
+    }
+
+    private void OnCloseTrayChecked(object sender, RoutedEventArgs e)
+    {
+        if (_loadingCloseAction)
+        {
+            return;
+        }
+
+        _viewModel.CloseAction = CloseAction.MinimizeToTray;
+        _viewModel.StatusText = "关闭窗口时收进托盘，程序继续在后台运行。";
+    }
+
+    /// <summary>
+    /// 独立模式要换文件归属、改 config.txt，所以不能在这里直接设值：
+    /// 等 ViewModel 真的换完档，开关才停在正确的位置。
+    /// </summary>
+    private async void OnIndependentModeChecked(object sender, RoutedEventArgs e)
+    {
+        if (_loadingIndependentMode)
+        {
+            return;
+        }
+
+        await ApplyIndependentModeAsync(true);
+    }
+
+    private async void OnIndependentModeUnchecked(object sender, RoutedEventArgs e)
+    {
+        if (_loadingIndependentMode)
+        {
+            return;
+        }
+
+        await ApplyIndependentModeAsync(false);
+    }
+
+    private async Task ApplyIndependentModeAsync(bool on)
+    {
+        var error = await _viewModel.SetIndependentModeAsync(on);
+        if (error is null)
+        {
+            return;
+        }
+
+        // 没切成：把开关拨回去，别让界面显示一个不存在的状态。
+        _loadingIndependentMode = true;
+        IndependentModeSwitch.IsChecked = !on;
+        _loadingIndependentMode = false;
+
+        AppDialog.Info(this, "独立模式", error);
     }
 
     // ---------------- 关于软件 ----------------
@@ -384,14 +472,15 @@ public partial class SettingsWindow : FluentWindow
 
     private void OnCopyStatus(object sender, RoutedEventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(_viewModel.StatusText))
+        var report = _viewModel.BuildDebugReport();
+        if (string.IsNullOrWhiteSpace(report))
         {
             return;
         }
 
         try
         {
-            System.Windows.Clipboard.SetText(_viewModel.StatusText);
+            System.Windows.Clipboard.SetText(report);
         }
         catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
         {

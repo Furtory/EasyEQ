@@ -1,6 +1,8 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using PeaceWpf.Core.Audio;
@@ -38,6 +40,140 @@ public partial class AutoCalibrateWindow : FluentWindow
     /// <summary>这一轮是否用激进参数（两轮没变化、用户确认后切过来）。</summary>
     private bool _aggressive;
 
+    /// <summary>点过「套用矫正EQ」没有。没点就关窗口，主窗口会当作取消。</summary>
+    public bool Applied { get; private set; }
+
+    /// <summary>窗口是不是被收起来了。</summary>
+    public bool IsCollapsed { get; private set; }
+
+    /// <summary>点主界面就收起：不移动、不变透明，直接藏起来。</summary>
+    public void Collapse()
+    {
+        if (IsCollapsed)
+        {
+            return;
+        }
+
+        Hide();
+        IsCollapsed = true;
+    }
+
+    /// <summary>点自动EQ 按钮就按原位置显示回来，并补一段和其他窗口一致的淡入。</summary>
+    public void Expand()
+    {
+        if (!IsCollapsed)
+        {
+            Activate();
+            return;
+        }
+
+        Show();
+        IsCollapsed = false;
+        Activate();
+        PlayShowAnimation();
+    }
+
+    /// <summary>
+    /// 隐藏再显示不会重放系统那套窗口打开动画，这里对内容补一段：
+    /// 淡入 + 轻微上移，180 ms，和 FluentWindow 的观感接近。
+    /// </summary>
+    private void PlayShowAnimation()
+    {
+        if (Content is not FrameworkElement root)
+        {
+            return;
+        }
+
+        var slide = new TranslateTransform(0, 12);
+        root.RenderTransform = slide;
+        root.Opacity = 0;
+
+        var duration = new Duration(TimeSpan.FromMilliseconds(180));
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        root.BeginAnimation(
+            OpacityProperty,
+            new DoubleAnimation(1, duration) { EasingFunction = ease });
+        slide.BeginAnimation(
+            TranslateTransform.YProperty,
+            new DoubleAnimation(0, duration) { EasingFunction = ease });
+    }
+
+    // ---- 教程：让这个窗口自己演 ----
+
+    /// <summary>
+    /// 教程用：装一份写死的实测，窗口按平常那套流程算两层、画三条线。
+    ///
+    /// 曲线不是遮罩层另画的——走的是同一个 <see cref="EqCurveFitter"/>、同一份 <see cref="DrawPlot"/>，
+    /// 只是没有真的扫频。演示态下「开始测量 / 套用」都锁着：这两条线不属于用户的设备。
+    /// </summary>
+    internal void LoadTutorialMeasurement(SweepMeasurement measurement)
+    {
+        if (_closed || _busy || measurement.Points.Count == 0)
+        {
+            return;
+        }
+
+        _tutorialDemo = true;
+        _baselinePlan = null;
+        _measurement = measurement;
+        _crossoverHz = EqCurveFitter.CalibrationFloorHz;
+        _compensationPercent = 0;
+        _boostWired = false;
+        BoostSlider.Value = 0;
+        _boostWired = true;
+        StartButton.IsEnabled = false;
+        ApplyButton.IsEnabled = false;
+        RefitForCrossover(quick: false);
+    }
+
+    /// <summary>教程用：把黄线挪到某个频率并按它重算两层。quick 给拖动途中用。</summary>
+    internal void SetTutorialCrossover(double hz, bool quick)
+    {
+        if (_closed || _busy || !_tutorialDemo)
+        {
+            return;
+        }
+
+        var clamped = Math.Round(Math.Clamp(hz, MinCrossoverHz, MaxCrossoverHz));
+        if (Math.Abs(clamped - _crossoverHz) >= 0.5)
+        {
+            _crossoverHz = clamped;
+            RefitForCrossover(quick);
+        }
+
+        DrawPlot();
+    }
+
+    /// <summary>教程用：把「贴合目标 ↔ 保证音量」滑杆挪到某个百分比并按它重算。quick 给拖动途中用。</summary>
+    internal void SetTutorialBoost(double percent, bool quick)
+    {
+        if (_closed || _busy || !_tutorialDemo)
+        {
+            return;
+        }
+
+        var value = Math.Clamp(Math.Round(percent / 10) * 10, 0, 100);
+        _compensationPercent = value;
+        _boostWired = false;
+        BoostSlider.Value = value;
+        _boostWired = true;
+        RefitForCrossover(quick);
+    }
+
+    /// <summary>教程用：黄线在当前画面里的屏幕坐标（设备像素），遮罩把光标放到那里。</summary>
+    internal Point TutorialCrossoverScreenPoint() =>
+        Plot.PointToScreen(new Point(PlotX(_crossoverHz), Plot.ActualHeight * 0.42));
+
+    /// <summary>教程用：滑杆拇指的屏幕坐标（设备像素）。</summary>
+    internal Point TutorialBoostScreenPoint()
+    {
+        var travel = Math.Max(1, BoostSlider.ActualWidth - 16);
+        var x = 8 + travel * (BoostSlider.Value - BoostSlider.Minimum)
+            / Math.Max(1, BoostSlider.Maximum - BoostSlider.Minimum);
+        return BoostSlider.PointToScreen(new Point(x, BoostSlider.ActualHeight / 2));
+    }
+
     /// <summary>
     /// 激进倍率：1.0 = 常规（gain 0.9 / 每段 6 dB），大于 1 就是这一轮更大步。
     /// 固定死一档会「激进过头」，第 3 轮起按前两轮的残差比自适应。
@@ -48,6 +184,16 @@ public partial class AutoCalibrateWindow : FluentWindow
     private readonly List<double> _roundResiduals = [];
     private bool _busy;
     private bool _closed;
+
+    /// <summary>
+    /// 这一轮扫频要不要实时预览 EQ 矫正曲线。
+    ///
+    /// 只有「手上还没有结果」的那一轮（一次测量的第 1 轮，也是唯一测裸设备的一轮）开：
+    /// 那时候曲线边测边长，能看出个子丑寅卯。后面几轮是在上一轮曲线上做微调，
+    /// 实时预览只会让一条本来已经定住的线跟着抖动，反而看不清——那几轮图上保留上一轮的
+    /// 矫正曲线，本轮拟合结果在轮末存下来，下一轮开头整条换上。
+    /// </summary>
+    private bool _liveEqEnabled = true;
 
     /// <summary>测量按钮的三态：闲着 / 正在测 / 已请求停止（等本轮跑完）。</summary>
     private enum MeasureState
@@ -99,6 +245,30 @@ public partial class AutoCalibrateWindow : FluentWindow
     private FitDensity _density = FitDensity.Normal;
 
     /// <summary>
+    /// 预增益补偿百分比（0–100）。前 50% 把被压掉的整体音量补回来，
+    /// 后 50% 预增益固定 0、放开曲线提升，峰值超出 0 dBFS 的部分就是允许的削波。
+    /// </summary>
+    private double _compensationPercent;
+
+    /// <summary>
+    /// 这一轮样本不够：可用点不到总数的一半。按钮会变成「重测本轮」，
+    /// 刻度条已经自动往「保证音量」挪了 3 dB。
+    /// </summary>
+    private bool _sampleShort;
+
+    /// <summary>
+    /// 教程演示态：窗口里那份「实测」是写死的，曲线照样走真实拟合器和真实画法，
+    /// 但「开始测量 / 套用」锁住——这两条线不是用户的设备，套用会写错预设。
+    /// </summary>
+    private bool _tutorialDemo;
+
+    /// <summary>滑杆防抖：拖动途中每跨 1 dB 都会触发一次，停手后再按最终值重算。</summary>
+    private DispatcherTimer? _boostFitTimer;
+
+    /// <summary>OnLoaded 之后才认滑杆的 ValueChanged：InitializeComponent 里设 Value 也会触发一次。</summary>
+    private bool _boostWired;
+
+    /// <summary>
     /// 这次测量时喇叭上已经套着的 EQ（用上一轮的结果近似）。没把当前 EQ 拉平时才非 null——
     /// 实测里含着它，拟合前必须先减掉，否则同一个凹陷会被补第二遍。
     /// </summary>
@@ -112,9 +282,6 @@ public partial class AutoCalibrateWindow : FluentWindow
 
     /// <summary>实时拟合的版本号：后台算完时只让最新那一份回到界面。</summary>
     private int _liveFitVersion;
-
-    /// <summary>连续多少次进度报告里电平都是 -90；到这个数就提示换设备（每 100 ms 一次，1.5 秒）。</summary>
-    private const int SilentReportThreshold = 15;
 
     /// <summary>
     /// 一次点「测量」跑几轮。1 = 点一下只跑一轮（第一轮测裸喇叭，继续轮套用后再测一轮）。
@@ -156,8 +323,6 @@ public partial class AutoCalibrateWindow : FluentWindow
     /// <summary>相邻两轮的 EQ 曲线差不到这个值（dB），就算收敛、不再加轮。</summary>
     private const double ConvergedDb = 1.0;
 
-    private int _silentReports;
-
     /// <summary>本轮测量是不是跑到了「拟合完成」这一步。中断、失败都算没跑成。</summary>
     private bool _runSucceeded;
 
@@ -176,6 +341,10 @@ public partial class AutoCalibrateWindow : FluentWindow
     private const double EqEase = 0.22;
 
     private DispatcherTimer? _eqTimer;
+    private DispatcherTimer? _etaTimer;
+    private int _totalRounds;
+    private int _currentRound;
+    private int _roundMs;
 
     // ---- 矫正起点：图上那条可拖的竖线 ----
     //
@@ -195,13 +364,56 @@ public partial class AutoCalibrateWindow : FluentWindow
     /// <summary>最近一次正式测量。拖动分界线后拿它重算，不用重测。</summary>
     private SweepMeasurement? _measurement;
 
-    private bool _draggingCrossover;
+    // ---- 麦克风矫正曲线 ----
+    //
+    // 测到的是「喇叭 + 麦克风」。导入一条麦克风曲线之后，拟合之前先把麦克风那段减掉，
+    // 否则 EQ 会去纠麦克风的偏差，换个麦克风听就不对了。
+    // 原始实测（_measurement）一直留着：换曲线、清曲线都从同一份数据重算，不用重扫。
 
-    /// <summary>拖动时重算的节流时间：Q 搜索一轮几十毫秒，每次都算会拖手。</summary>
-    private long _lastCrossoverFitAt;
+    /// <summary>图上那条细线的颜色，和 XAML 图例里的一致。</summary>
+    private static readonly Color MicCalColor = Color.FromRgb(0x6F, 0xD3, 0xC7);
+
+    /// <summary>载入曲线后按钮用的强调色，和「目标」那条蓝线同一支。</summary>
+    private static readonly Color MicCalAccent = Color.FromRgb(0x4C, 0xC2, 0xFF);
+
+    /// <summary>导入的麦克风曲线；null 表示不矫正。</summary>
+    private MicCalibrationCurve? _micCurve;
+
+    /// <summary>曲线文件路径：按钮提示里显示，也是下次打开窗口自动载入的依据。</summary>
+    private string? _micCurvePath;
+
+    private bool _draggingCrossover;
 
     /// <summary>分界线重算的版本号：拖动时会连发多次，只让最后一次回到界面。</summary>
     private int _crossoverFitVersion;
+
+    /// <summary>
+    /// 拖动黄线时实时重算的最小间隔。完整 Q 搜索一次约 0.1 秒，比这更密只是排队，
+    /// 排队的旧结果最后都会被版本号丢掉，白烧 CPU 还抢 UI 线程。
+    /// </summary>
+    private const int LiveRefitIntervalMs = 90;
+
+    /// <summary>拖动重算是否已有一个在跑（0/1，跨线程用 Interlocked 读写）。</summary>
+    private int _liveRefitInFlight;
+
+    /// <summary>拖动中又挪了位置：手上这次算完，按最新起点再补一次。</summary>
+    private bool _liveRefitPending;
+
+    /// <summary>上一次真正开始拖动重算的时刻，给节流用。</summary>
+    private long _lastLiveRefitAt;
+
+    /// <summary>节流到点时触发下一次拖动重算。</summary>
+    private DispatcherTimer? _liveRefitTimer;
+
+    /// <summary>
+    /// 目标曲线整体压低的量（dB）。第一次拟合算出来之后就钉住，拖动分界线、拖动补偿滑杆都沿用。
+    ///
+    /// <see cref="EqCurveFitter"/> 会自动按「分界线以上最难达成的一段」压低整条目标：
+    /// 设备够不着目标时，压低比硬加增益诚实。但拖动分界线会改变「分界线以上」的范围，
+    /// 这个压量跟着重算，整条目标就上下平移——用户看到的就是「拖动时曲线整体在跳」。
+    /// 所以只在第一轮测量时算一次，之后的变化交给分界线本身去表达。
+    /// </summary>
+    private double? _targetOffsetDb;
 
     public AutoCalibrateWindow(MainViewModel viewModel, CalibrationTargetKind target)
     {
@@ -216,19 +428,42 @@ public partial class AutoCalibrateWindow : FluentWindow
         _eqTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
         _eqTimer.Tick += OnEqTick;
 
+        _etaTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _etaTimer.Tick += (_, _) => UpdateRemainingText();
+
         Title = $"自动EQ · {TargetCurve.DisplayName(target)}";
         TargetText.Text = "校准到：" + TargetCurve.DisplayName(target);
         TargetHint.Text = TargetCurve.Description(target);
 
+        // 上次导入的麦克风曲线：文件还在就悄悄套上，不在了当作没有。
+        RestoreMicCalibration();
+
         Loaded += OnLoaded;
         Closing += OnClosing;
         Closed += OnClosed;
+
+        // 主界面拖完曲线：回来按补偿滑杆重算，再刷回那边。
+        _viewModel.CalibrationEdited += OnMainEdited;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         LoadDevices();
         LoadOptions();
+        BoostSlider.Value = _compensationPercent;
+        BoostSlider.ValueChanged += OnBoostChanged;
+        _boostWired = true;
+
+        _boostFitTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _boostFitTimer.Tick += (_, _) =>
+        {
+            _boostFitTimer.Stop();
+            if (!_busy && _measurement is not null && !_closed)
+            {
+                RefitForCrossover(quick: false);
+            }
+        };
+
         DrawPlot();
     }
 
@@ -272,6 +507,9 @@ public partial class AutoCalibrateWindow : FluentWindow
     private void OnClosed(object? sender, EventArgs e)
     {
         _closed = true;
+        _etaTimer?.Stop();
+        StopLiveRefit();
+        _viewModel.CalibrationEdited -= OnMainEdited;
 
         // 只发取消，不 Dispose：测量任务可能还捏着这个 token，取消后它会在下一个
         // await 处抛出来。Dispose 交给下一次测量开头，或者随窗口一起回收。
@@ -284,6 +522,32 @@ public partial class AutoCalibrateWindow : FluentWindow
         _ = _viewModel.EndSweepPreviewAsync();
     }
 
+    /// <summary>
+    /// 主界面手拖完曲线：以拖出来的形状为准，只按补偿滑杆重算预增益，再写回主界面。
+    ///
+    /// 这里不再截断形状。自动EQ 的结果在拟合时已经按补偿档截过一轮，手调回来的点
+    /// 如果在这里再截一次，每拖一次整条曲线就被多压一刀——用户看到的就是「拖一下、
+    /// 松手后曲线自己往下掉一截」。截断的职责留在拟合那一步，手调之后形状只听手的。
+    /// </summary>
+    private void OnMainEdited()
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        var edited = _viewModel.MainPoints;
+        var (_, preAmp) = EqCurveFitter.ApplyCompensation(edited, _compensationPercent);
+
+        if (_plan is not null)
+        {
+            _plan = _plan.WithPoints(edited, preAmp);
+        }
+
+        _viewModel.ApplyEditedCalibration(edited, _viewModel.BassPoints, preAmp);
+        DrawPlot();
+    }
+
     private void LoadDevices()
     {
         var devices = MicrophoneCaptureService.ListDevices();
@@ -293,7 +557,6 @@ public partial class AutoCalibrateWindow : FluentWindow
         {
             DeviceBox.IsEnabled = false;
             StartButton.IsEnabled = false;
-            StatusText.Text = "系统里没有可用的录音设备。插上麦克风，或者在 Windows 的声音设置里启用一个输入设备。";
             return;
         }
 
@@ -351,14 +614,15 @@ public partial class AutoCalibrateWindow : FluentWindow
         {
             case MeasureState.Running:
                 _stopRequested = true;
+                // 停止 = 这一轮跑完就收手，剩余次数立刻压成 1 次。
+                UpdateRemainingText();
                 SetState(MeasureState.Stopping);
-                StatusText.Text = "正在停止…本轮扫频会走完，再点一下可以撤销。";
                 return;
 
             case MeasureState.Stopping:
                 _stopRequested = false;
+                UpdateRemainingText();
                 SetState(MeasureState.Running);
-                StatusText.Text = "继续测量…";
                 return;
         }
 
@@ -382,44 +646,110 @@ public partial class AutoCalibrateWindow : FluentWindow
     /// </summary>
     private async Task MeasureLoopAsync(int totalRounds)
     {
-        for (var round = 1; round <= totalRounds; round++)
+        _totalRounds = totalRounds;
+        _roundMs = EstimateRoundMs();
+        _etaTimer?.Start();
+
+        try
         {
-            if (_closed)
+            for (var round = 1; round <= totalRounds; round++)
             {
-                return;
-            }
+                _currentRound = round;
+                UpdateRemainingText();
 
-            var before = _plan;
-            if (round > 1)
+                if (_closed)
+                {
+                    return;
+                }
+
+                var before = _plan;
+
+                if (round > 1)
+                {
+                    await Task.Delay(400);
+                }
+
+                if (_closed)
+                {
+                    return;
+                }
+
+                _hasMoreRounds = round < totalRounds;
+
+                await RunMeasurementAsync();
+
+                if (!_runSucceeded || _closed || _stopRequested || _plan is null)
+                {
+                    return;
+                }
+
+                if (round >= totalRounds)
+                {
+                    return;
+                }
+
+                // 更准档的 3 轮是设计的一部分：每轮换一次曲线、再测一遍。
+                // 不按残差提前收手——用户要的就是「3 轮跑满、一轮比一轮贴」。
+                _ = MaxDiffDb(before ?? _plan, _plan);
+            }
+        }
+        finally
+        {
+            _etaTimer?.Stop();
+            var stopped = _stopRequested;
+            _totalRounds = 0;
+            _currentRound = 0;
+            _stopRequested = false;
+            if (!_closed)
             {
-                StatusText.Text = $"第 {round}/{totalRounds} 轮：接着测「补过之后」还剩多少…";
-                await Task.Delay(400);
+                // 停下后还能点「继续测量」再扫最后一次，所以这里显示 1 次而不是清空。
+                RemainingText.Text = stopped && _plan is not null
+                    ? $"还剩 1 次扫频 · 约 {FormatEta(TimeSpan.FromMilliseconds(_roundMs))}"
+                    : string.Empty;
             }
-
-            if (_closed)
-            {
-                return;
-            }
-
-            _hasMoreRounds = round < totalRounds;
-
-            await RunMeasurementAsync();
-
-            if (!_runSucceeded || _closed || _stopRequested || _plan is null)
-            {
-                return;
-            }
-
-            if (round >= totalRounds)
-            {
-                return;
-            }
-
-            // 更准档的 3 轮是设计的一部分：每轮换一次曲线、再测一遍。
-            // 不按残差提前收手——用户要的就是「3 轮跑满、一轮比一轮贴」。
-            _ = MaxDiffDb(before ?? _plan, _plan);
         }
     }
+
+    /// <summary>单轮大致要多久：按当前档位的频点数算，再补上开麦和分析的余量。</summary>
+    private int EstimateRoundMs()
+    {
+        var count = SpeedBox.SelectedIndex switch
+        {
+            0 => SweepPlan.BuildFastFrequencies().Length,
+            2 => SweepPlan.BuildPreciseFrequencies().Length,
+            _ => SweepPlan.BuildStandardFrequencies().Length,
+        };
+
+        return SweepPlan.TotalMsFor(count) + 1500;
+    }
+
+    /// <summary>进度条上方那行：还剩几次扫频、大概还要多久。</summary>
+    private void UpdateRemainingText()
+    {
+        if (_closed || _totalRounds <= 0 || _currentRound <= 0)
+        {
+            return;
+        }
+
+        var stopping = _stopRequested;
+        var leftRounds = stopping ? 1 : Math.Max(0, _totalRounds - _currentRound + 1);
+        if (leftRounds == 0)
+        {
+            RemainingText.Text = string.Empty;
+            return;
+        }
+
+        // 本轮按进度条估，后面几轮按整轮估；已经请求停止就只剩这一轮。
+        var progress = Math.Clamp(Progress.Value / 100.0, 0, 1);
+        var leftMs = _roundMs * (1 - progress)
+            + (stopping ? 0 : _roundMs * (_totalRounds - _currentRound));
+        RemainingText.Text = $"还剩 {leftRounds} 次扫频 · 约 {FormatEta(TimeSpan.FromMilliseconds(Math.Max(0, leftMs)))}";
+    }
+
+    private static string FormatEta(TimeSpan eta) =>
+        eta.TotalSeconds < 60
+            ? $"{Math.Max(1, (int)Math.Ceiling(eta.TotalSeconds))} 秒"
+            : $"{(int)eta.TotalMinutes} 分 {eta.Seconds} 秒";
 
     /// <summary>两套方案的实际响应差多少（1/12 倍频程上取最大值）。</summary>
     private static double MaxDiffDb(CalibrationPlan before, CalibrationPlan after)    {
@@ -502,7 +832,6 @@ public partial class AutoCalibrateWindow : FluentWindow
         {
             _plan = FitFromFeedback(appliedPlan, measurement, _density);
             DrawPlot();
-            UpdateResultSummary(measurement);
             Trace($"aggressive refit corr={_plan.CorrectionRange.Min:0.0}..{_plan.CorrectionRange.Max:0.0}");
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
@@ -553,7 +882,8 @@ public partial class AutoCalibrateWindow : FluentWindow
             MaxStepDb * _aggressiveScale,
             _crossoverHz,
             quick: false,
-            aggressive: _aggressive);
+            aggressive: _aggressive,
+            compensationPercent: _compensationPercent);
 
     /// <summary>
     /// 生成低频矫正曲线。低频点不够时返回 null——主层结果照常可用，只是不写低音层。
@@ -562,17 +892,21 @@ public partial class AutoCalibrateWindow : FluentWindow
     /// 反相（或者补到目标）只需按当前实测算一次，没有「再测一轮验证」这回事。
     /// </summary>
     private EqPointList? TryFitBass(SweepMeasurement measurement, bool quick = false) =>
-        FitBassSafe(measurement, _target, _baselinePlan?.Points, _crossoverHz, quick);
+        FitBassSafe(measurement, _target, _baselinePlan?.Points, _crossoverHz, quick, _compensationPercent);
 
     /// <summary>
     /// 低频拟合的线程安全版本：不读窗口字段，后台线程也能直接调。
+    ///
+    /// <paramref name="compensationPercent"/> 是左下补偿滑杆：低频测不到时，
+    /// 兜底的低频曲线按它决定提升多少（见 <see cref="EqCurveFitter.BassFallbackMinPoints"/>）。
     /// </summary>
     private static EqPointList? FitBassSafe(
         SweepMeasurement measurement,
         CalibrationTargetKind target,
         EqPointList? baseline,
         double ceilingHz,
-        bool quick)
+        bool quick,
+        double compensationPercent)
     {
         // 还没扫到分界线就先不画：低频段只测了半截时拟合出来会是个假台阶，
         // 等这一段扫完再显示，图上才和耳朵听到的一致。
@@ -585,7 +919,8 @@ public partial class AutoCalibrateWindow : FluentWindow
         try
         {
             return EqCurveFitter.FitBass(
-                target, measurement, baseline, ceilingHz: ceilingHz, quick: quick);
+                target, measurement, baseline, ceilingHz: ceilingHz, quick: quick,
+                compensationPercent: compensationPercent);
         }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
@@ -593,55 +928,185 @@ public partial class AutoCalibrateWindow : FluentWindow
         }
     }
 
+    // ---- 麦克风矫正曲线：导入、清除、套到实测上 ----
+
+    /// <summary>
+    /// 把导入的麦克风曲线套到实测上。没有曲线时原样返回。
+    ///
+    /// 教程那份实测是写死的样本，不属于用户的设备，不参与矫正——不然演示出来的
+    /// 曲线会被人自己的麦克风文件改掉。
+    /// </summary>
+    private SweepMeasurement Corrected(SweepMeasurement measurement) =>
+        _micCurve is null || _tutorialDemo ? measurement : _micCurve.ApplyTo(measurement);
+
+    /// <summary>
+    /// 窗口打开时按上次记住的路径悄悄载入。文件被删了、格式坏了都当作「没有曲线」，
+    /// 不弹窗打断——上次的选择不该变成这次开窗口的拦路虎。
+    /// </summary>
+    private void RestoreMicCalibration()
+    {
+        var path = _viewModel.MicCalibrationFile;
+        if (!string.IsNullOrWhiteSpace(path) && !TryLoadMicCalibration(path, out var error))
+        {
+            Trace($"mic cal restore failed: {error}");
+        }
+
+        UpdateMicCalibrationUi();
+    }
+
+    /// <summary>读一条曲线进 <see cref="_micCurve"/>。失败时清空，并把原因交给调用方。</summary>
+    private bool TryLoadMicCalibration(string path, out string? error)
+    {
+        try
+        {
+            _micCurve = MicCalibrationCurve.Load(path);
+            _micCurvePath = path;
+            error = null;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException)
+        {
+            _micCurve = null;
+            _micCurvePath = null;
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>按钮和提示跟着状态走：载入了变蓝、提示里写文件名和范围，没载入写怎么用。</summary>
+    private void UpdateMicCalibrationUi()
+    {
+        if (_micCurve is null)
+        {
+            MicCalibrationButton.ClearValue(System.Windows.Controls.Control.ForegroundProperty);
+            MicCalibrationButton.ToolTip =
+                "把你的测量麦克风的频响曲线导进来，实测会先扣掉麦克风自己的偏差，拟合出来的 EQ 才是喇叭的。\n"
+                + "两列文本就行：频率（Hz，可写 1k）、偏差（dB）。导入后按钮变蓝，右键清除。";
+            return;
+        }
+
+        MicCalibrationButton.Foreground = new SolidColorBrush(MicCalAccent);
+        MicCalibrationButton.ToolTip =
+            $"正在用：{_micCurve.Name}\n"
+            + $"{_micCurve.PointCount} 个点 · {_micCurve.MinFrequencyHz:0}–{_micCurve.MaxFrequencyHz:0} Hz · "
+            + $"{_micCurve.MinGainDb:+0.0;-0.0;0.0} ~ {_micCurve.MaxGainDb:+0.0;-0.0;0.0} dB\n"
+            + "实测会先扣掉这条偏差（1 kHz 锚点不动）。右键清除。";
+    }
+
+    /// <summary>
+    /// 曲线变了：手上如果已经有实测，就拿同一份原始数据重算，不重扫。
+    /// 没有实测（还没开始测）就只重画，图上那条细线先显示出来。
+    /// </summary>
+    private void ApplyMicCalibrationToResult()
+    {
+        // 重算出来的结果还没套到「左右」层：按钮要重新变成可套用。
+        _applied = false;
+
+        if (_measurement is null || _busy)
+        {
+            DrawPlot();
+            return;
+        }
+
+        RefitForCrossover(quick: false);
+    }
+
+    private void OnImportMicCalibration(object sender, RoutedEventArgs e)
+    {
+        // 测量途中不改：这一轮的点已经按旧曲线算下去了，中途换尺子只会让结果前后不一致。
+        if (_busy)
+        {
+            return;
+        }
+
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "选麦克风矫正曲线",
+            Filter = "曲线文本 (*.txt;*.csv;*.cal)|*.txt;*.csv;*.cal|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+        };
+
+        // 上次那个文件所在的目录就是下次的起点，省得每次都从「文档」翻回来。
+        if (!string.IsNullOrWhiteSpace(_micCurvePath))
+        {
+            var directory = System.IO.Path.GetDirectoryName(_micCurvePath);
+            if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            {
+                dialog.InitialDirectory = directory;
+            }
+        }
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        if (!TryLoadMicCalibration(dialog.FileName, out var error))
+        {
+            UpdateMicCalibrationUi();
+            AppDialog.Info(this, "这条曲线读不了", error ?? "文件读不出来，也可能格式不对。");
+            return;
+        }
+
+        _viewModel.SetMicCalibrationFile(_micCurvePath);
+        UpdateMicCalibrationUi();
+        Trace($"mic cal loaded {_micCurvePath} points={_micCurve!.PointCount}");
+        ApplyMicCalibrationToResult();
+    }
+
+    private void OnClearMicCalibration(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        e.Handled = true;
+        if (_micCurve is null || _busy)
+        {
+            return;
+        }
+
+        _micCurve = null;
+        _micCurvePath = null;
+        _viewModel.SetMicCalibrationFile(null);
+        UpdateMicCalibrationUi();
+        Trace("mic cal cleared");
+        ApplyMicCalibrationToResult();
+    }
+
     /// <summary>低频层里真正会写进后端的段数（不算端点、不算 0 dB）。</summary>
     private static int BassBandCount(EqPointList points) =>
         points.Points.Count(point => !point.IsEndpoint && Math.Abs(point.GainDb) >= 0.005);
 
-    /// <summary>把这次结果的一句话摘要写进右上角；拖动分界线后也走这里。</summary>
-    private void UpdateResultSummary(SweepMeasurement measurement)
-    {
-        if (_plan is null)
-        {
-            SummaryText.Text = string.Empty;
-            return;
-        }
-
-        // 段中心是自己挪的，还是挪了也不更贴所以留在格点上——两种都合理，得说清楚是哪种。
-        var gridFrequencies = EqCurveFitter.BuildFrequencies(_density, _crossoverHz);
-        var shiftedBands = _plan.Points.Points
-            .Where(point => !point.IsEndpoint)
-            .Count(point => gridFrequencies.All(grid => Math.Abs(grid - point.FrequencyHz) > 0.05));
-
-        var placementNote = shiftedBands > 0
-            ? $" · {shiftedBands} 段按实测挪出了格点"
-            : " · 段频率留在格点上（挪了不更贴）";
-
-        var bassNote = _bassPlan is null
-            ? " · 低频曲线：这次点不够，没生成"
-            : $" · 低频 {EqCurveFitter.BassFloorHz:0}–{_crossoverHz:0} Hz "
-                + $"{BassBandCount(_bassPlan)} 段";
-
-        SummaryText.Text = $"{_plan.Summary} · 可用频点 {measurement.UsableCount}/{measurement.Points.Count}{placementNote}{bassNote}";
-    }
-
     /// <summary>
     /// 分界线变了：用最近一次实测按新起点重算主层和低音层，不重测。
     /// 重算出来的还没套到主窗口，所以要把「已套用」清掉、重新允许套用。
-    /// quick=true 给拖动途中用（只解一套 Q），松手时用 false 跑完整搜索。
+    ///
+    /// <paramref name="live"/> = true 是拖动途中的实时跟随：同一时刻只跑一个（见
+    /// <see cref="PumpLiveRefit"/>），结果照常画，但不写预设文件、不进撤回栈；
+    /// 松手时再用 <paramref name="live"/> = false 落一次盘。
+    ///
+    /// 拖动途中始终用完整搜索（quick = false），和松手那一次算法一致——
+    /// 以前拖动跑的是 quick（不摆位、只解一套 Q、不逐段收尾），和松手的完整结果交替出现，
+    /// 曲线就在「粗糙」和「圆滑」之间来回闪。
     /// </summary>
-    private void RefitForCrossover(bool quick)
+    /// <returns>true 表示确实起了一次后台拟合。</returns>
+    private bool RefitForCrossover(bool quick, bool live = false)
     {
         if (_measurement is null || _busy)
         {
-            return;
+            return false;
         }
 
         var version = Interlocked.Increment(ref _crossoverFitVersion);
-        var measurement = _measurement;
+        var measurement = Corrected(_measurement);
         var target = _target;
         var density = _density;
         var baseline = _baselinePlan?.Points;
         var crossover = _crossoverHz;
+        var maxBoost = _compensationPercent;
+        // 目标整体压量：首轮算出来后钉住，别再按新起点重算（否则整条曲线会上下平移）。
+        var targetOffset = _targetOffsetDb;
+
+        // 教程演示按「只削不增」跑：提升上限收紧到 0，凹陷处留空、曲线不会翻到 0 dB 以上。
+        // 真实测量仍用程序默认的 9 dB 上限。
+        var boostLimit = _tutorialDemo ? 0 : EqCurveFitter.MaxBoostDb;
 
         _ = Task.Run(() =>
         {
@@ -650,45 +1115,135 @@ public partial class AutoCalibrateWindow : FluentWindow
             try
             {
                 plan = EqCurveFitter.Fit(
-                    target, measurement, null, density, baseline,
-                    movableBands: !quick, floorHz: crossover, quick: quick);
-                bass = FitBassSafe(measurement, target, baseline, crossover, quick);
+                    target, measurement, targetOffset, density, baseline,
+                    movableBands: !quick, floorHz: crossover, quick: quick,
+                    maxBoostDb: boostLimit, compensationPercent: maxBoost);
+                bass = FitBassSafe(measurement, target, baseline, crossover, quick, maxBoost);
             }
             catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
             {
-                Dispatcher.InvokeAsync(() =>
+                Trace($"crossover refit failed at {crossover:0} Hz: {ex.Message}");
+                if (live)
                 {
-                    if (_closed || version != Volatile.Read(ref _crossoverFitVersion))
-                    {
-                        return;
-                    }
+                    Dispatcher.InvokeAsync(() => EndLiveRefit());
+                }
 
-                    StatusText.Text = $"矫正起点 {crossover:0} Hz：这份实测在这个起点上点不够，先保留上一次曲线。";
-                });
                 return;
             }
 
             Dispatcher.InvokeAsync(() =>
             {
-                if (_closed || version != Volatile.Read(ref _crossoverFitVersion))
+                if (!_closed && version == Volatile.Read(ref _crossoverFitVersion))
                 {
-                    return;
+                    _plan = plan;
+                    // 首轮把目标压量钉住；之后重算（拖分界线、拖滑杆）都沿用它，整条曲线不再上下跳。
+                    _targetOffsetDb = plan.TargetOffsetDb;
+                    _bassPlan = bass;
+                    // 拖动重算的结果也不能被还在飞的实时预览盖住。
+                    Interlocked.Increment(ref _liveFitVersion);
+                    _livePlan = null;
+                    _liveBassPlan = null;
+                    _applied = false;
+                    ApplyButton.IsEnabled = plan.FilterCount > 0 && !_tutorialDemo;
+                    DrawPlot();
+
+                    // 拖分界线、拖补偿滑杆、样本不足重算都走这里：主界面的曲线和预增益跟着动。
+                    // 拖动中的中间结果不落盘、不进撤回栈，省掉每次 0.1 秒都写三份文件的抖动。
+                    _viewModel.UpdateCalibrationPreview(plan, bass, commit: !live);
                 }
 
-                _plan = plan;
-                _bassPlan = bass;
-                // 拖动重算的结果也不能被还在飞的实时预览盖住。
-                Interlocked.Increment(ref _liveFitVersion);
-                _livePlan = null;
-                _liveBassPlan = null;
-                _applied = false;
-                UpdateResultSummary(measurement);
-                ApplyButton.IsEnabled = plan.FilterCount > 0;
-                StatusText.Text = $"矫正起点改成 {crossover:0} Hz，已按同一份实测重算两层。"
-                    + "点「套用矫正EQ」才会写回主窗口。";
-                DrawPlot();
+                // 只给实时任务收尾：非实时重算不该碰这把单飞锁（可能正有一次实时在跑）。
+                // 不管这次结果用没用到（可能已经被更新的请求顶掉），都要放开锁，
+                // 并按黄线的最新位置排下一次。
+                if (live)
+                {
+                    EndLiveRefit();
+                }
             });
         });
+
+        return true;
+    }
+
+    /// <summary>黄线或补偿滑杆正在被拖：这段时间走实时重算。</summary>
+    private bool IsLiveDragging => _draggingCrossover || _boostDragging;
+
+    /// <summary>
+    /// 拖动途中排一次重算。黄线先动，曲线随后跟上。
+    /// </summary>
+    private void QueueLiveRefit()
+    {
+        _liveRefitPending = true;
+        PumpLiveRefit();
+    }
+
+    /// <summary>松手 / 关窗口：不再排新的拖动重算。</summary>
+    private void StopLiveRefit()
+    {
+        _liveRefitPending = false;
+        _liveRefitTimer?.Stop();
+    }
+
+    /// <summary>
+    /// 拖动重算的调度器。只在 UI 线程调用。
+    ///
+    /// 同一时刻只跑一个完整搜索（约 0.1 秒）：叠着跑会占满线程池，鼠标反而更涩。
+    /// 跑完时如果黄线又挪了（<see cref="_liveRefitPending"/>），立刻按最新起点补一次；
+    /// 间隔不到 <see cref="LiveRefitIntervalMs"/> 就交给计时器等一小会儿。
+    /// </summary>
+    private void PumpLiveRefit()
+    {
+        if (!_liveRefitPending)
+        {
+            return;
+        }
+
+        if (!IsLiveDragging || _closed || _busy || _measurement is null)
+        {
+            _liveRefitPending = false;
+            _liveRefitTimer?.Stop();
+            return;
+        }
+
+        if (Volatile.Read(ref _liveRefitInFlight) != 0)
+        {
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var wait = LiveRefitIntervalMs - (now - _lastLiveRefitAt);
+        if (wait > 0)
+        {
+            _liveRefitTimer ??= new DispatcherTimer();
+            _liveRefitTimer.Stop();
+            _liveRefitTimer.Interval = TimeSpan.FromMilliseconds(wait);
+            _liveRefitTimer.Tick -= OnLiveRefitTick;
+            _liveRefitTimer.Tick += OnLiveRefitTick;
+            _liveRefitTimer.Start();
+            return;
+        }
+
+        _liveRefitTimer?.Stop();
+        _liveRefitPending = false;
+        _lastLiveRefitAt = now;
+        Interlocked.Exchange(ref _liveRefitInFlight, 1);
+        if (!RefitForCrossover(quick: false, live: true))
+        {
+            Interlocked.Exchange(ref _liveRefitInFlight, 0);
+        }
+    }
+
+    private void OnLiveRefitTick(object? sender, EventArgs e)
+    {
+        _liveRefitTimer?.Stop();
+        PumpLiveRefit();
+    }
+
+    /// <summary>一次拖动重算收尾（UI 线程）：放开单飞锁，若还有待办的再排一次。</summary>
+    private void EndLiveRefit()
+    {
+        Interlocked.Exchange(ref _liveRefitInFlight, 0);
+        PumpLiveRefit();
     }
 
     /// <summary>频率 → 画布横坐标，和 <see cref="DrawPlot"/> 里的对数轴一致。</summary>
@@ -699,6 +1254,13 @@ public partial class AutoCalibrateWindow : FluentWindow
     }
 
     /// <summary>画布横坐标 → 频率。</summary>
+    /// <summary>dB → 画布纵坐标，和 DrawPlot 里的纵轴一致。</summary>
+    private double PlotY(double db)
+    {
+        var plotHeight = Plot.ActualHeight - AxisTop - AxisBottom;
+        return AxisTop + (_maxDb - Math.Clamp(db, _minDb, _maxDb)) / (_maxDb - _minDb) * plotHeight;
+    }
+
     private double FrequencyAt(double x)
     {
         var plotWidth = Plot.ActualWidth - AxisLeft - AxisRight;
@@ -748,14 +1310,12 @@ public partial class AutoCalibrateWindow : FluentWindow
 
         _crossoverHz = hz;
 
-        // 拖动途中只解一套 Q；松手时再跑完整搜索。
-        var now = Environment.TickCount64;
-        if (now - _lastCrossoverFitAt >= 120)
-        {
-            _lastCrossoverFitAt = now;
-            RefitForCrossover(quick: true);
-        }
-
+        // 拖动途中实时重算：黄线先动，曲线随后跟上。
+        //
+        // 用的是同一个完整搜索（不是以前的 quick 轻量版），所以中途和松手后的形状一致，
+        // 不会「一会儿平滑一会儿锯齿」。同一时刻只跑一个（PumpLiveRefit），
+        // 算完若黄线又挪了，就按最新位置再补一次；中间结果不写盘、不进撤回栈。
+        QueueLiveRefit();
         DrawPlot();
         e.Handled = true;
     }
@@ -768,8 +1328,10 @@ public partial class AutoCalibrateWindow : FluentWindow
         }
 
         _draggingCrossover = false;
+        StopLiveRefit();
         Plot.ReleaseMouseCapture();
         Plot.Cursor = Cursors.Arrow;
+        // 松手：用同一个起点跑最后一次，这一次才落盘（写预设、进撤回栈）。
         RefitForCrossover(quick: false);
         DrawPlot();
         e.Handled = true;
@@ -798,6 +1360,99 @@ public partial class AutoCalibrateWindow : FluentWindow
     ///
     /// 取消时把下拉退回原档；测量过程中下拉是禁用的，不会走到这里。
     /// </summary>
+    /// <summary>
+    /// 刻度条变了：更新提升上限。手上有实测就按新上限把当前曲线重算一遍，
+    /// 不然刻度条要等下一轮测量才生效。
+    /// </summary>
+    private void OnBoostChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (!_boostWired)
+        {
+            return;
+        }
+
+        _compensationPercent = Math.Clamp(Math.Round(e.NewValue), 0, 100);
+        if (_busy || _measurement is null)
+        {
+            return;
+        }
+
+        // 拖着滑杆：和拖黄线共用同一个实时调度器（同一时刻只跑一个完整搜索）。
+        // 点一下 / 键盘改值没有拖动过程，仍然防抖到停手后按最终值重算。
+        if (_boostDragging)
+        {
+            _boostFitTimer?.Stop();
+            QueueLiveRefit();
+            return;
+        }
+
+        _boostFitTimer?.Stop();
+        _boostFitTimer?.Start();
+    }
+
+    /// <summary>滑杆正在拖：数值气泡跟着鼠标走。</summary>
+    private bool _boostDragging;
+
+    private void OnBoostDragStart(object sender, MouseButtonEventArgs e)
+    {
+        _boostDragging = true;
+        // 拖动前按下那一下可能已经排了防抖重算：实时路径接管，别让它插一脚。
+        _boostFitTimer?.Stop();
+        ShowBoostTip(e.GetPosition(BoostSlider));
+    }
+
+    private void OnBoostDragMove(object sender, MouseEventArgs e)
+    {
+        if (_boostDragging)
+        {
+            ShowBoostTip(e.GetPosition(BoostSlider));
+        }
+    }
+
+    private void OnBoostDragUp(object sender, MouseButtonEventArgs e) => EndBoostDrag();
+
+    private void OnBoostDragLeave(object sender, MouseEventArgs e)
+    {
+        // 拖动时鼠标可能短暂滑出杆体（左键还按着），这时不收起；
+        // 松开或真正离开才收起。
+        if (e.LeftButton == MouseButtonState.Released)
+        {
+            EndBoostDrag();
+        }
+    }
+
+    /// <summary>
+    /// 滑杆松手：停掉实时重算，按最终值完整算一次——这一次才写预设、进撤回栈。
+    /// 拖动中的中间结果只更新界面，和拖黄线那边的收尾一致。
+    /// </summary>
+    private void EndBoostDrag()
+    {
+        if (!_boostDragging)
+        {
+            HideBoostTip();
+            return;
+        }
+
+        HideBoostTip();
+        StopLiveRefit();
+        RefitForCrossover(quick: false);
+    }
+
+    /// <summary>气泡放在鼠标上方：坐标相对滑杆，DPI 缩放不会偏。</summary>
+    private void ShowBoostTip(Point position)
+    {
+        BoostTipText.Text = $"{Math.Round(BoostSlider.Value):0}%";
+        BoostTip.HorizontalOffset = position.X - 18;
+        BoostTip.VerticalOffset = position.Y - 38;
+        BoostTip.IsOpen = true;
+    }
+
+    private void HideBoostTip()
+    {
+        _boostDragging = false;
+        BoostTip.IsOpen = false;
+    }
+
     private void OnSpeedChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_revertingSpeed || _busy)
@@ -814,6 +1469,8 @@ public partial class AutoCalibrateWindow : FluentWindow
             _bassPlan = null;
             _liveBassPlan = null;
             _measurement = null;
+            _targetOffsetDb = null;
+            _sampleShort = false;
             return;
         }
 
@@ -842,11 +1499,11 @@ public partial class AutoCalibrateWindow : FluentWindow
         _livePlan = null;
         _liveBassPlan = null;
         _measurement = null;
+        _targetOffsetDb = null;
         _livePoints = Array.Empty<MeasurementPoint>();
         _applied = false;
+        _sampleShort = false;
         Array.Clear(_eqValid);
-        SummaryText.Text = string.Empty;
-        StatusText.Text = "换档了，之前那份结果已经撤掉。点「开始测量」按新档重测。";
         ApplyButton.IsEnabled = false;
         SetState(MeasureState.Idle);
         DrawPlot();
@@ -858,13 +1515,23 @@ public partial class AutoCalibrateWindow : FluentWindow
 
         // 测量中不许换档：换了也只会影响下一轮，徒增困惑。
         SpeedBox.IsEnabled = state == MeasureState.Idle;
+
+        // 提升上限同理：本轮拟合用的是开始测量时捕获的值，测量中拖动只会改下一轮，
+        // 看着就是「拖了这轮没反应」，所以测量期间直接禁用。
+        BoostSlider.IsEnabled = state == MeasureState.Idle;
+
+        // 麦克风曲线也只在空闲时能换：测量中途换「尺子」，这一轮先后的点就对不上了。
+        MicCalibrationButton.IsEnabled = state == MeasureState.Idle;
         StartButton.Content = state switch
         {
             MeasureState.Running => "停止测量",
             MeasureState.Stopping => "等待结束",
 
             // 手里有结果就是「继续」：再点一次会先把这套套上去，然后立刻再测一轮。
-            _ => _plan is null ? "开始测量" : "继续测量",
+            // 这一轮样本不够时改成「重测本轮」，刻度条已经自动往保证音量挪过 3 dB。
+            _ => _plan is null
+                ? "开始测量"
+                : _sampleShort ? "重测本轮" : "继续测量",
         };
 
         if (PreviewButton is not null)
@@ -907,17 +1574,15 @@ public partial class AutoCalibrateWindow : FluentWindow
         {
             // 预增益只用左右层那份：低频提升不参与，和套用时同一条规则。
             var preAmp = _plan?.PreAmpDb ?? _viewModel.PreAmpDb;
-            var (ok, message) = await _viewModel.BeginSweepPreviewAsync(main, bass, preAmp);
+            var (ok, _) = await _viewModel.BeginSweepPreviewAsync(main, bass, preAmp);
             if (!ok)
             {
-                StatusText.Text = message ?? "试听叠加低频失败。";
                 return;
             }
         }
 
         if (!_sweepPreview.Play())
         {
-            StatusText.Text = "试听放不出来：" + (_sweepPreview.LastError ?? "没有可用的输出设备");
             if (layered)
             {
                 await _viewModel.EndSweepPreviewAsync();
@@ -925,11 +1590,6 @@ public partial class AutoCalibrateWindow : FluentWindow
 
             return;
         }
-
-        StatusText.Text = _bassPlan is not null
-            ? $"正在放 5 秒扫频：叠上了 {EqCurveFitter.BassFloorHz:0}–{_crossoverHz:0} Hz 的低频矫正。"
-                + "只有试听叠低频，测量时不叠。"
-            : "正在放 5 秒扫频：20 Hz 一路扫到 20 kHz，听到的就是现在这套 EQ。";
 
         StartSweepCursor();
 
@@ -1035,6 +1695,15 @@ public partial class AutoCalibrateWindow : FluentWindow
             points[i] = points[i] with { LevelDb = points[i].RawDb - reference };
         }
 
+        // 麦克风偏差在这里就扣掉：图上这条灰线从长出来的第一秒起就该是「喇叭的样子」，
+        // 不能等测完换了正式结果才突然变一次。
+        if (_micCurve is not null && !_tutorialDemo)
+        {
+            var corrected = _micCurve.ApplyTo(new SweepMeasurement(
+                points, reference, 48000, points.Select(point => point.FrequencyHz).ToArray()));
+            points = corrected.Points.ToArray();
+        }
+
         _livePoints = points;
 
         var now = Environment.TickCount64;
@@ -1046,7 +1715,8 @@ public partial class AutoCalibrateWindow : FluentWindow
         _lastLiveDrawAt = now;
 
         // 同一时间只放一个后台拟合；算得比 500 ms 慢时，中间那些轮直接跳过。
-        if (points.Length >= 6 && Interlocked.CompareExchange(ref _liveFitBusy, 1, 0) == 0)
+        // 第 2 轮起不再实时拟合：图上要一直挂着上一轮的矫正曲线，本轮结果等轮末整条换上。
+        if (_liveEqEnabled && points.Length >= 6 && Interlocked.CompareExchange(ref _liveFitBusy, 1, 0) == 0)
         {
             var version = Interlocked.Increment(ref _liveFitVersion);
             var frequencies = points.Select(point => point.FrequencyHz).ToArray();
@@ -1058,6 +1728,7 @@ public partial class AutoCalibrateWindow : FluentWindow
             var applied = _applied && _plan is not null;
             var previous = _plan;
             var firstLive = _livePlan is null;
+            var maxBoost = _compensationPercent;
 
             _ = Task.Run(() =>
             {
@@ -1067,10 +1738,10 @@ public partial class AutoCalibrateWindow : FluentWindow
                     live = applied && previous is not null
                         ? EqCurveFitter.FitFeedback(
                             target, previous, measurement, density, FeedbackGain, MaxStepDb,
-                            crossover, quick: true)
+                            crossover, quick: true, compensationPercent: maxBoost)
                         : EqCurveFitter.Fit(
                             target, measurement, null, density, baseline,
-                            movableBands: false, floorHz: crossover, quick: true);
+                            movableBands: false, floorHz: crossover, quick: true, compensationPercent: maxBoost);
                 }
                 catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
                 {
@@ -1116,7 +1787,6 @@ public partial class AutoCalibrateWindow : FluentWindow
 
         if (DeviceBox.Items.Count == 0)
         {
-            StatusText.Text = "没有选到麦克风。";
             return;
         }
 
@@ -1131,13 +1801,15 @@ public partial class AutoCalibrateWindow : FluentWindow
         _stopRequested = false;
         _runSucceeded = false;
 
+        // 测量期间主窗口的试听/预览写盘会和拉平抢 peace.txt，先挡住。
+        _viewModel.SetCalibrationMeasuring(true);
+
         // 上一轮的结果一直留着：测的这二十多秒里，图上画的还是它，测完才被新结果替掉。
         // 继续测之前先把它套上去——这一轮测到的才是「补过之后还剩多少」，而不是又测一遍原样。
         var previous = _plan;
         Trace($"start previousNull={previous is null} applied={_applied}");
         if (previous is not null && !_applied)
         {
-            StatusText.Text = "先把上一轮的结果套到「左右」层…";
             try
             {
                 // 连低音层一起套：这条结果套过一次，低频矫正就该跟着在；
@@ -1146,9 +1818,9 @@ public partial class AutoCalibrateWindow : FluentWindow
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                Trace($"apply before measure failed: {ex.Message}");
                 _busy = false;
                 SetState(MeasureState.Idle);
-                StatusText.Text = "套用失败，这一轮没开始：" + ex.Message;
                 return;
             }
 
@@ -1159,7 +1831,6 @@ public partial class AutoCalibrateWindow : FluentWindow
             {
                 _busy = false;
                 SetState(MeasureState.Idle);
-                StatusText.Text = "还没进到「左右」层：主窗口里还有没保存的改动，先处理掉，再点「继续测量」。";
                 return;
             }
 
@@ -1167,9 +1838,6 @@ public partial class AutoCalibrateWindow : FluentWindow
             ApplyButton.IsEnabled = false;
             Trace($"applied mode={_viewModel.Mode}");
         }
-
-        // 这一轮测的是不是「上一套已经生效」之后的样子。用在最后的提示语里。
-        var continuingWithEq = previous is not null && _applied;
 
         _livePoints = Array.Empty<MeasurementPoint>();
         _livePlan = null;
@@ -1185,7 +1853,6 @@ public partial class AutoCalibrateWindow : FluentWindow
 
         var deviceId = (DeviceBox.SelectedItem as CaptureDevice)?.Id;
         CalibrateDeviceMemory.Save(deviceId);
-        _silentReports = 0;
 
         var mode = Math.Clamp(SpeedBox.SelectedIndex, 0, 2);
 
@@ -1235,7 +1902,6 @@ public partial class AutoCalibrateWindow : FluentWindow
             }
 
             Progress.Value = Math.Clamp(item.Fraction * 100, 0, 100);
-            StatusText.Text = item.Stage;
             UpdateLive(item.PartialPoints);
             _currentHz = item.CurrentHz;
             DrawSweepCursor();
@@ -1249,26 +1915,16 @@ public partial class AutoCalibrateWindow : FluentWindow
             else
             {
                 LevelText.Text = "—";
-                return;
-            }
-
-            // 扫频已经走起来了还一直是 -90：这个端点根本没接信号，调音量没用，得换设备。
-            if (item.Fraction > 0.05 && level <= -89)
-            {
-                _silentReports++;
-            }
-            else
-            {
-                _silentReports = 0;
-            }
-
-            if (_silentReports >= SilentReportThreshold)
-            {
-                StatusText.Text = item.Stage + " · 这个端点一直没信号（-90 dB），换上面的麦克风试试";
             }
         });
 
         var flattened = false;
+
+        // 手上还没有结果 = 这次是第 1 轮（测裸设备）：开实时预览。
+        // 「继续测量」、第 2/3 轮、重测本轮都不开——那几轮图上保留上一轮的矫正曲线，
+        // 本轮拟合结果在轮末存下来，下一轮开头整条换上。
+        _liveEqEnabled = previous is null;
+
         try
         {
             // 第一次测量才拉平：测裸喇叭，从零算。
@@ -1279,10 +1935,6 @@ public partial class AutoCalibrateWindow : FluentWindow
                 : await _viewModel.BeginCalibrationMeasurementKeepEqAsync();
 
             flattened = flat.Flat;
-            if (!flat.Flat && flat.Message is not null)
-            {
-                StatusText.Text = flat.Message;
-            }
 
             // 拉平了，实测是裸喇叭；没拉平，实测里含着上一轮那份 EQ，拟合前得先减掉。
             _baselinePlan = flattened ? null : previous;
@@ -1290,7 +1942,7 @@ public partial class AutoCalibrateWindow : FluentWindow
             // 拉平这几百毫秒里窗口可能已经被关掉：别再把扫频放出来。
             token.ThrowIfCancellationRequested();
 
-            var measurement = await SweepMeasureService.RunAdaptiveAsync(
+            var rawMeasurement = await SweepMeasureService.RunAdaptiveAsync(
                 deviceId, stabilityDb, maxRepeats, progress, token, () => _stopRequested, frequencies,
                 fixedRepeats: true);
             if (_closed)
@@ -1298,30 +1950,35 @@ public partial class AutoCalibrateWindow : FluentWindow
                 return;
             }
 
-            // 留着这份实测：拖动分界线时按同一个起点重算，不用重新扫频。
-            _measurement = measurement;
+            // 原始实测留一份：换麦克风曲线、拖分界线都按它重算，不用重新扫频。
+            // 往下的拟合用的是扣掉麦克风偏差那一份——图上「实测」就该是喇叭本身的样子。
+            _measurement = rawMeasurement;
+            var measurement = Corrected(rawMeasurement);
+
+            // 新测量、新目标：目标压量重新算一次，之后拖动只在这一次的值上。
+            _targetOffsetDb = null;
 
             // 完整 Q 搜索放后台：要解几遍方程再逐段收尾，放 UI 线程会假死好几秒，
             // 进度条看起来就是「卡在 100%」。
-            StatusText.Text = "测完了，正在拟合…";
-
             var crossover = _crossoverHz;
             var baselineForFit = _baselinePlan?.Points;
             var useFeedback = _applied && previous is not null;
             var appliedPlan = previous;
+            var maxBoost = _compensationPercent;
 
             var fitted = await Task.Run(() =>
             {
                 var plan = useFeedback
                     ? EqCurveFitter.FitFeedback(
-                        _target, appliedPlan!, measurement, density, FeedbackGain, MaxStepDb, crossover)
+                        _target, appliedPlan!, measurement, density, FeedbackGain, MaxStepDb, crossover,
+                        compensationPercent: maxBoost)
                     : EqCurveFitter.Fit(
                         _target, measurement, null, density, baselineForFit,
-                        movableBands: true, floorHz: crossover);
+                        movableBands: true, floorHz: crossover, compensationPercent: maxBoost);
 
                 // 低频矫正按同一份实测单独算：这段不追反馈轮次，因为测量时低音层不叠加，
                 // 测回来永远是主设备的裸低频，反相（或补到目标）只有一个答案。
-                var bass = FitBassSafe(measurement, _target, baselineForFit, crossover, quick: false);
+                var bass = FitBassSafe(measurement, _target, baselineForFit, crossover, quick: false, maxBoost);
                 return (Plan: plan, Bass: bass);
             }).ConfigureAwait(true);
 
@@ -1331,7 +1988,23 @@ public partial class AutoCalibrateWindow : FluentWindow
             }
 
             _plan = fitted.Plan;
+            // 这一轮的目标压量就此钉住：后面拖分界线只重算形状，不再让整条曲线上下平移。
+            _targetOffsetDb = _plan.TargetOffsetDb;
             _bassPlan = fitted.Bass;
+
+            // 推给主界面：曲线和预增益立刻钉在那边，测量期间主窗口的预览写盘已被挡掉。
+            _viewModel.UpdateCalibrationPreview(_plan, _bassPlan);
+
+            // 可用点不到一半：这一轮样本不够。按钮变「重测本轮」，
+            // 刻度条自动往「保证音量」挪 3 dB，下一轮多提一点弱频段。
+            _sampleShort = measurement.UsableCount * 2 < measurement.Points.Count;
+            if (_sampleShort)
+            {
+                _compensationPercent = Math.Min(100, _compensationPercent + 10);
+                _boostWired = false;
+                BoostSlider.Value = _compensationPercent;
+                _boostWired = true;
+            }
 
             // 新结果到手，旧的那份就不算「已套用」了；实时预览那份也退场，别盖住正式结果。
             // 版本号也要往前走一步：还在后台跑的实时拟合不能再画上来。
@@ -1353,41 +2026,14 @@ public partial class AutoCalibrateWindow : FluentWindow
 
             Trace($"fit done filters={_plan.FilterCount} baseline={_baselinePlan is not null} "
                 + $"aggressive={_aggressive} flattened={flattened} "
+                + $"engine={measurement.EngineName ?? "-"} usable={measurement.UsableCount}/{measurement.Points.Count} "
+                + $"dirty={measurement.DirtyCount} "
                 + $"gains={GainRange(_plan.Points)} corr={_plan.CorrectionRange.Min:0.0}..{_plan.CorrectionRange.Max:0.0} "
                 + $"worst={string.Join(",", worst)}");
-
-            UpdateResultSummary(measurement);
-
-            string status;
-            if (flattened)
-            {
-                status = "测完了。看图确认一下形状；想再准一点就点「继续测量」——先把这套套上去，再测一遍。";
-            }
-            else if (continuingWithEq)
-            {
-                status = "测完了：这一轮是在上一套 EQ 已经生效的情况下测的，拟合时已经把它的贡献扣掉了。"
-                    + "要再细一点就再点一次「继续测量」。";
-            }
-            else
-            {
-                status = "测完了，但这次没有把当前 EQ 拉平，结果里包含现有曲线 —— 套用会叠上去。";
-            }
-
-            if (_plan.TargetOffsetDb < -0.05)
-            {
-                status += $" 设备够不着原始目标，目标已整体压低 {-_plan.TargetOffsetDb:0.0} dB。";
-            }
-
-            if (_bassPlan is not null)
-            {
-                status += $" 绿色是低音层的低频矫正（{BassBandCount(_bassPlan)} 段），"
-                    + "只在「试听扫频」时叠加；测量时不叠，因为设备不一定发得出。";
-            }
 
             // 扫完了，绿线退场；结果图不带游标。
             _currentHz = null;
 
-            StatusText.Text = status;
             Progress.Value = 100;
             DrawPlot();
             ApplyButton.IsEnabled = _plan.FilterCount > 0;
@@ -1424,7 +2070,6 @@ public partial class AutoCalibrateWindow : FluentWindow
                         _aggressive = true;
                         _aggressiveScale = 2.0;
                         TryRefitAggressive(measurement, previous);
-                        StatusText.Text += " 下一轮换激进参数。";
                         Trace("auto aggressive for next round");
                     }
                     else if (residual > StalledResidualDb)
@@ -1436,17 +2081,23 @@ public partial class AutoCalibrateWindow : FluentWindow
         }
         catch (OperationCanceledException)
         {
-            if (!_closed)
-            {
-                StatusText.Text = "已停止。";
-            }
+            // 停止是常态，不弹提示。
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
+            Trace($"measure failed: {ex.Message}");
             if (!_closed)
             {
-                StatusText.Text = "测量失败：" + ex.Message;
                 Progress.Value = 0;
+
+                // 这一轮没测成，手上还留着上一轮的结果：把它恢复成「可用」的样子。
+                // 不然按钮会一直停在测量中的灰色，图上也只剩上一轮的线，看着像程序坏了。
+                if (_plan is not null)
+                {
+                    ApplyButton.IsEnabled = _plan.FilterCount > 0;
+                }
+
+                StartButton.Content = _plan is null ? "开始测量" : "继续测量";
             }
         }
         finally
@@ -1457,7 +2108,20 @@ public partial class AutoCalibrateWindow : FluentWindow
             }
 
             _busy = false;
-            _stopRequested = false;
+            _viewModel.SetCalibrationMeasuring(false);
+
+            // 测量期间主窗口的预览写盘被挡着，结果出来后放开并推一次，APO 那边才真的听到。
+            if (_plan is not null && !_closed)
+            {
+                _viewModel.UpdateCalibrationPreview(_plan, _bassPlan);
+            }
+
+            // 样本不足时这条曲线是按旧上限算的，按自动 +3 之后的上限重算一次；
+            // 必须等 _busy 落下，RefitForCrossover 开头有这个守卫。
+            if (_sampleShort && _measurement is not null && !_closed)
+            {
+                RefitForCrossover(quick: false);
+            }
             if (!_closed)
             {
                 // 半截预览退场：中断或失败时，图上回到「手上那份结果」，不是一堆没测完的点。
@@ -1478,15 +2142,14 @@ public partial class AutoCalibrateWindow : FluentWindow
         ApplyButton.IsEnabled = false;
         try
         {
-            // 主层 + 低音层一起写：低频曲线整层替换「低音」层，叠加开关会自动打开。
-            var message = await _viewModel.ApplyCalibrationAsync(_plan, _bassPlan);
+            // 套用 = 覆盖主界面当前选中的配置；预览会话到此结束，关窗口不会再撤销。
+            await _viewModel.ApplyCalibrationPreviewAsync();
             _applied = true;
-            StatusText.Text = message;
-            SummaryText.Text = message;
+            Applied = true;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            StatusText.Text = "套用失败：" + ex.Message;
+            Trace($"apply failed: {ex.Message}");
             ApplyButton.IsEnabled = true;
         }
     }
@@ -1514,6 +2177,84 @@ public partial class AutoCalibrateWindow : FluentWindow
 
     private const double DefaultMinDb = -15;
     private const double DefaultMaxDb = 15;
+
+    /// <summary>主界面编辑模式那条曲线的蓝，左右 EQ 和目标都用它。</summary>
+    private static readonly Color EqBlue = Color.FromRgb(0x4C, 0xC2, 0xFF);
+
+    /// <summary>主界面低音编辑模式的紫，低频矫正在没削波时用它。</summary>
+    private static readonly Color BassPurple = Color.FromRgb(0xA7, 0x8B, 0xFA);
+
+    /// <summary>削波到这一档就全红。</summary>
+    private static readonly Color ClipRed = Color.FromRgb(0xFF, 0x4D, 0x4D);
+
+    private const double ClipRedAtDb = 6.0;
+
+    /// <summary>低频本来就要提得多，红色到 12 dB 才满。</summary>
+    private const double BassClipRedAtDb = 12.0;
+
+    /// <summary>按削波量把基色往红拉：0 dB 保持原色，到 redAtDb 及以上全红。</summary>
+    private static Color ClipTint(Color baseColor, double clipDb, double redAtDb)
+    {
+        var t = Math.Clamp(clipDb / redAtDb, 0, 1);
+        if (t <= 0)
+        {
+            return baseColor;
+        }
+
+        return Color.FromRgb(
+            (byte)Math.Round(baseColor.R + (ClipRed.R - baseColor.R) * t),
+            (byte)Math.Round(baseColor.G + (ClipRed.G - baseColor.G) * t),
+            (byte)Math.Round(baseColor.B + (ClipRed.B - baseColor.B) * t));
+    }
+
+    /// <summary>某个频率上的削波量：取最近的测量点，不顺滑，反正颜色看不出那么细。</summary>
+    private static double ClipAt(CalibrationPlan? plan, double hz)
+    {
+        if (plan is null || plan.ClipDb.Count == 0)
+        {
+            return 0;
+        }
+
+        var best = 0.0;
+        var bestDistance = double.MaxValue;
+        for (var i = 0; i < plan.Measured.Count && i < plan.ClipDb.Count; i++)
+        {
+            var distance = Math.Abs(Math.Log(plan.Measured[i].FrequencyHz / hz));
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = plan.ClipDb[i];
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>逐段画曲线：每段的颜色按两端削波量的平均值取，同色段不合并也够用。</summary>
+    private void AddSegmentedCurve(
+        IReadOnlyList<(double Hz, double Db)> samples,
+        Color baseColor,
+        Func<double, double> clipAt,
+        double thickness,
+        double opacity,
+        double redAtDb = ClipRedAtDb)
+    {
+        for (var i = 1; i < samples.Count; i++)
+        {
+            var clip = (clipAt(samples[i - 1].Hz) + clipAt(samples[i].Hz)) / 2;
+            Plot.Children.Add(new Line
+            {
+                X1 = PlotX(samples[i - 1].Hz),
+                Y1 = PlotY(samples[i - 1].Db),
+                X2 = PlotX(samples[i].Hz),
+                Y2 = PlotY(samples[i].Db),
+                Stroke = new SolidColorBrush(ClipTint(baseColor, clip, redAtDb)),
+                StrokeThickness = thickness,
+                Opacity = opacity,
+                IsHitTestVisible = false,
+            });
+        }
+    }
 
     /// <summary>
     /// 当前纵轴范围。默认 ±15，实测掉得更低时自动往下撑。
@@ -1564,6 +2305,13 @@ public partial class AutoCalibrateWindow : FluentWindow
                 min = Math.Min(min, gain);
                 max = Math.Max(max, gain);
             }
+        }
+
+        // 预增益线是水平基准，得保证它始终落在可视范围内。
+        if (plan?.PreAmpDb is double preAmp)
+        {
+            min = Math.Min(min, preAmp);
+            max = Math.Max(max, preAmp);
         }
 
         // 5 dB 一档、上下各留一点余量；至少 30 dB 跨度，曲线不会被压扁。
@@ -1679,7 +2427,114 @@ public partial class AutoCalibrateWindow : FluentWindow
         double Y(double db) =>
             AxisTop + (_maxDb - Math.Clamp(db, _minDb, _maxDb)) / (_maxDb - _minDb) * plotHeight;
 
+        // 实测灰线：只把「可用」的点连成曲线，用单调三次插值（穿过每个点、峰谷不过冲）画圆滑；
+        // 判脏 / 信噪比不够的点不进曲线，单独画成空心圈——意思是「这里测到了，但不可信」。
+        //
+        // judge=false 是测量途中的临时点：那批点还没算纯度（实时走的是宽带 RMS），
+        // 这时候判脏没有意义，直接连起来就行，颜色浅一点，和正式结果区分开。
+        //
+        // 矫正起点以下的低频点用 EqCurveFitter.TrustedLowMask：信噪比门槛更严，
+        // 孤立在噪声里的一两个点也不采信——和拟合实际用的是同一批点，图不会说假话。
+        void DrawMeasured(IReadOnlyList<MeasurementPoint> points, bool judge, bool provisional = false, bool dim = false)
+        {
+            if (points.Count == 0)
+            {
+                return;
+            }
+
+            var lowMask = EqCurveFitter.TrustedLowMask(points, _crossoverHz);
+            bool TrustedAt(int index)
+            {
+                var point = points[index];
+                return point.IsUsable || (point.FrequencyHz < _crossoverHz && lowMask[index]);
+            }
+
+            var usable = new List<(double Hz, double Db)>(points.Count);
+            for (var i = 0; i < points.Count; i++)
+            {
+                var point = points[i];
+                if (double.IsFinite(point.LevelDb) && (!judge || TrustedAt(i)))
+                {
+                    usable.Add((point.FrequencyHz, point.LevelDb));
+                }
+            }
+
+            var curve = SmoothCurve.Build(usable);
+            if (curve is not null)
+            {
+                var line = new Polyline
+                {
+                    Stroke = new SolidColorBrush(provisional
+                        ? Color.FromRgb(0xB4, 0xB4, 0xB4)
+                        : dim
+                            ? Color.FromRgb(0x5C, 0x5C, 0x5C)
+                            : Color.FromRgb(0x90, 0x90, 0x90)),
+                    StrokeThickness = 1.4,
+                    StrokeLineJoin = PenLineJoin.Round,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                };
+
+                foreach (var (hz, db) in curve.Sample(480))
+                {
+                    line.Points.Add(new System.Windows.Point(X(hz), Y(db)));
+                }
+
+                Plot.Children.Add(line);
+            }
+
+            if (!judge)
+            {
+                return;
+            }
+
+            for (var i = 0; i < points.Count; i++)
+            {
+                var point = points[i];
+                if (TrustedAt(i) || !double.IsFinite(point.LevelDb))
+                {
+                    continue;
+                }
+
+                var dot = new Ellipse
+                {
+                    Width = 5,
+                    Height = 5,
+                    Stroke = new SolidColorBrush(dim
+                        ? Color.FromRgb(0x4A, 0x4A, 0x4A)
+                        : Color.FromRgb(0x78, 0x78, 0x78)),
+                    StrokeThickness = 1.1,
+                    Fill = Brushes.Transparent,
+                    IsHitTestVisible = false,
+                };
+
+                // 用全限定名：文件里有 Wpf.Ui.Controls，直接 using System.Windows.Controls 会和它撞名。
+                System.Windows.Controls.Canvas.SetLeft(dot, X(point.FrequencyHz) - 2.5);
+                System.Windows.Controls.Canvas.SetTop(dot, Y(point.LevelDb) - 2.5);
+                Plot.Children.Add(dot);
+            }
+        }
+
         DrawGrid(X, Y, plotWidth, plotHeight);
+
+        // 预增益：整条曲线整体下移的基准，红色虚线。先画它、再画曲线——
+        // 曲线会盖在上面，不会挡住左右和低音曲线。
+        if (plan is not null && Math.Abs(plan.PreAmpDb) >= 0.05)
+        {
+            var preAmpY = Y(plan.PreAmpDb);
+            Plot.Children.Add(new Line
+            {
+                X1 = AxisLeft,
+                X2 = AxisLeft + plotWidth,
+                Y1 = preAmpY,
+                Y2 = preAmpY,
+                Stroke = new SolidColorBrush(Color.FromRgb(0xFF, 0x5A, 0x5A)),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 3, 4 },
+                IsHitTestVisible = false,
+            });
+        }
+
         DrawSweepCursor();
 
         // 矫正起点：分界线以上由左右层拟合，以下交给低音层反相。
@@ -1710,7 +2565,7 @@ public partial class AutoCalibrateWindow : FluentWindow
         // 目标曲线
         var target = new Polyline
         {
-            Stroke = new SolidColorBrush(Color.FromRgb(0x4F, 0x9B, 0xFF)),
+            Stroke = new SolidColorBrush(EqBlue),
             StrokeThickness = 1.6,
             StrokeDashArray = new DoubleCollection { 4, 3 },
         };
@@ -1721,6 +2576,30 @@ public partial class AutoCalibrateWindow : FluentWindow
         }
 
         Plot.Children.Add(target);
+
+        // 麦克风曲线：细虚线，和实测用同一把 dB 尺子——它扣掉多少，图上就画多少。
+        // 画在实测之前，让灰线压在上面：这条是「尺子的刻度」，不是主角。
+        if (_micCurve is not null)
+        {
+            var mic = new Polyline
+            {
+                Stroke = new SolidColorBrush(MicCalColor),
+                StrokeThickness = 1.1,
+                StrokeDashArray = new DoubleCollection { 2, 3 },
+                StrokeLineJoin = PenLineJoin.Round,
+                IsHitTestVisible = false,
+            };
+
+            foreach (var (hz, db) in _micCurve.Sample())
+            {
+                mic.Points.Add(new System.Windows.Point(X(hz), Y(db)));
+            }
+
+            if (mic.Points.Count > 0)
+            {
+                Plot.Children.Add(mic);
+            }
+        }
 
         // 测量途中先画实时那份（边测边长），测完再换成正式结果；
         // 两个都没有才落到「还没凑够点」的那条分支——手上有上一轮的结果时，那二十多秒里图上画的就是它。
@@ -1733,43 +2612,27 @@ public partial class AutoCalibrateWindow : FluentWindow
             // 还没凑够能拟合的点，先把已经测到的画出来——不然头几秒什么都看不到。
             if (_livePoints.Length > 0)
             {
-                var raw = new Polyline
-                {
-                    Stroke = new SolidColorBrush(Color.FromRgb(0x90, 0x90, 0x90)),
-                    StrokeThickness = 1.4,
-                };
-                foreach (var point in _livePoints)
-                {
-                    raw.Points.Add(new System.Windows.Point(X(point.FrequencyHz), Y(point.LevelDb)));
-                }
-
-                Plot.Children.Add(raw);
+                DrawMeasured(_livePoints, judge: false);
             }
 
             return;
         }
 
-        // 实测
-        var measured = new Polyline
-        {
-            Stroke = new SolidColorBrush(Color.FromRgb(0x90, 0x90, 0x90)),
-            StrokeThickness = 1.4,
-        };
-        foreach (var point in plan.Measured)
-        {
-            measured.Points.Add(new System.Windows.Point(X(point.FrequencyHz), Y(point.LevelDb)));
-        }
+        // 实测。下一轮真的开扫之后，上一轮这条压暗（旧线退后、新线才看得清）；
+        // 轮与轮之间是亮的——那几十秒正是用来看上一轮结果的。
+        DrawMeasured(plan.Measured, judge: true, dim: _busy && !_liveEqEnabled);
 
-        Plot.Children.Add(measured);
+        // 测量途中，图上还挂着上一轮的结果时（「继续测量」），光画 plan 就是一动不动二十多秒。
+        // 把这一轮已经测到的点用浅灰叠上去，边测边长。
+        // 第 1 轮不用叠：那时候 plan 本身就是实时那份，再叠一遍等于同一根线画两次。
+        if (_busy && !_liveEqEnabled && _livePoints.Length > 0)
+        {
+            DrawMeasured(_livePoints, judge: false, provisional: true);
+        }
 
         var snapshot = plan.Points.ToSnapshot();
 
-        var eqLine = new Polyline
-        {
-            Stroke = new SolidColorBrush(Color.FromRgb(0xFF, 0xA9, 0x4D)),
-            StrokeThickness = 1.8,
-            Opacity = _livePlan is null ? 1.0 : 0.55,
-        };
+        var eqSamples = new List<(double Hz, double Db)>();
 
         var limit = _livePlan is not null && _livePoints.Length > 0
             ? _livePoints[^1].FrequencyHz
@@ -1794,39 +2657,48 @@ public partial class AutoCalibrateWindow : FluentWindow
             }
             else if (Math.Abs(_eqTarget[i] - _eqShown[i]) > 0.02)
             {
-                needsAnimation = true;
+                // 测量途中不追补间：这二十多秒里实时曲线每 0.5 秒就把整幅画布拆了重建一次，
+                // 再叠一个 30 fps 的补间，等于每秒重画三十遍。重到掉帧时，屏幕上就会留下
+                // 上一帧的线——也就是「残影」。测的时候直接落在目标上，稳。
+                if (_busy)
+                {
+                    _eqShown[i] = _eqTarget[i];
+                }
+                else
+                {
+                    needsAnimation = true;
+                }
             }
 
-            eqLine.Points.Add(new System.Windows.Point(X(hz), Y(_eqShown[i])));
+            eqSamples.Add((hz, _eqShown[i]));
         }
 
-        Plot.Children.Add(eqLine);
+        // 左右曲线：主界面编辑蓝，被削掉的提升越多越红。
+        AddSegmentedCurve(
+            eqSamples, EqBlue, hz => ClipAt(plan, hz), 1.8, _livePlan is null ? 1.0 : 0.55);
 
-        // 低音层的低频矫正：绿色虚线，只覆盖 20 Hz–分界线。它不在主层的推子范围里，
-        // 画出来是为了套用之前就能看见低频要补多少、哪里补得凶。
+        // 低音层的低频矫正：紫色，只覆盖 20 Hz–分界线。它不在主层的推子范围里，
+        // 画出来是为了套用之前就能看见低频要补多少、哪里补得凶；叠上主层预增益后
+        // 超出 0 dBFS 的部分同样染红。
         var bassPlan = _liveBassPlan ?? _bassPlan;
         if (bassPlan is not null)
         {
             var bassSnapshot = bassPlan.ToSnapshot();
-            var bassLine = new Polyline
-            {
-                Stroke = new SolidColorBrush(Color.FromRgb(0x66, 0xD9, 0x7A)),
-                StrokeThickness = 1.5,
-                StrokeDashArray = new DoubleCollection { 2, 2 },
-                Opacity = _liveBassPlan is null ? 1.0 : 0.7,
-            };
+            var bassSamples = new List<(double Hz, double Db)>();
 
             for (var hz = EqCurveFitter.BassFloorHz; hz <= _crossoverHz; hz *= Math.Pow(2, 1.0 / 24))
             {
-                bassLine.Points.Add(new System.Windows.Point(X(hz), Y(EqResponse.GainAt(bassSnapshot, hz))));
+                bassSamples.Add((hz, EqResponse.GainAt(bassSnapshot, hz)));
             }
 
             // 补最后一个分界点：循环按 1/24 倍频程走，未必正好落在上限上。
-            bassLine.Points.Add(new System.Windows.Point(
-                X(_crossoverHz),
-                Y(EqResponse.GainAt(bassSnapshot, _crossoverHz))));
+            bassSamples.Add((_crossoverHz, EqResponse.GainAt(bassSnapshot, _crossoverHz)));
 
-            Plot.Children.Add(bassLine);
+            var mainPreAmp = plan?.PreAmpDb ?? 0;
+            AddSegmentedCurve(
+                bassSamples, BassPurple,
+                hz => Math.Max(0, EqResponse.GainAt(bassSnapshot, hz) + mainPreAmp),
+                1.4, _liveBassPlan is null ? 1.0 : 0.7, BassClipRedAtDb);
         }
 
         if (needsAnimation)

@@ -7,6 +7,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Shapes;
 using PeaceWpf.Core.Audio;
+using PeaceWpf.Core.Model;
 
 namespace PeaceWpf;
 
@@ -36,6 +37,21 @@ public partial class TutorialOverlay : UserControl
 
     /// <summary>进阶课：曲线图区域不压变暗层，颜色和渐变看得见。</summary>
     public bool KeepGraphClear { get; set; }
+
+    /// <summary>挪真实窗口的矫正起点：参数是（Hz，拖动途中用快速重算）。</summary>
+    public Action<double, bool>? CrossoverSet { get; set; }
+
+    /// <summary>真实窗口里黄线的屏幕坐标（设备像素）。</summary>
+    public Func<Point>? CursorAtCrossover { get; set; }
+
+    /// <summary>挪真实窗口的「贴合目标 ↔ 保证音量」滑杆：参数是（百分比，快速重算）。</summary>
+    public Action<double, bool>? BoostSet { get; set; }
+
+    /// <summary>真实窗口里滑杆拇指的屏幕坐标（设备像素）。</summary>
+    public Func<Point>? CursorAtBoost { get; set; }
+
+    /// <summary>演示用的滑杆当前值，滑动时用来算起点。</summary>
+    private double? BoostPercent { get; set; }
 
     private Rect? _graphHole;
     private DemoPlot _demoPlot;
@@ -117,7 +133,7 @@ public partial class TutorialOverlay : UserControl
         _index = index;
 
         var step = _steps[index];
-        var hasDemo = step.CurveDemo || step.FlavorDemo || step.CrossoverDemo || step.RealCurveDemo;
+        var hasDemo = step.CurveDemo || step.FlavorDemo || step.CrossoverDemo || step.BoostDemo || step.RealCurveDemo;
         StepLabel.Text = _courseLabel + $" · {index + 1}/{_steps.Count}";
         TitleText.Text = step.Title;
         BodyText.Text = step.Body;
@@ -128,9 +144,11 @@ public partial class TutorialOverlay : UserControl
             ? "看演示：选目标 → 拖动 → 右键还原。"
             : step.CrossoverDemo
                 ? "看演示：黄线就是矫正起点，左右拖它。"
-                : step.CurveDemo
-                    ? "看曲线：先建点，再拖、滚轮、右键。"
-                    : string.Empty;
+                : step.BoostDemo
+                    ? "看演示：这条滑杆换的是补得多准、留多少音量。"
+                    : step.CurveDemo
+                        ? "看曲线：先建点，再拖、滚轮、右键。"
+                        : string.Empty;
         AudioButton.Visibility = step.AudioDemo ? Visibility.Visible : Visibility.Collapsed;
         AudioButton.Content = "播放对比";
         DemoButton.Visibility = hasDemo ? Visibility.Visible : Visibility.Collapsed;
@@ -150,8 +168,7 @@ public partial class TutorialOverlay : UserControl
         _graphHole = KeepGraphClear && TryGetTargetRect("EqGraph", out var graphRect) ? graphRect : null;
         UpdateSpotlight(target);
         PositionBubble(step, target);
-        Bubble.BeginAnimation(OpacityProperty, null);
-        Bubble.Opacity = 0;
+        SetBubbleOpacity(0);
 
         try
         {
@@ -179,6 +196,11 @@ public partial class TutorialOverlay : UserControl
             {
                 FadeBubbleInAfter(650);
                 StartCrossoverDemo(target);
+            }
+            else if (step.BoostDemo)
+            {
+                FadeBubbleInAfter(650);
+                StartBoostDemo(target);
             }
             else if (step.RealCurveDemo)
             {
@@ -283,6 +305,10 @@ public partial class TutorialOverlay : UserControl
         else if (step.CrossoverDemo)
         {
             StartCrossoverDemo(GetTargetRect(step.TargetId));
+        }
+        else if (step.BoostDemo)
+        {
+            StartBoostDemo(GetTargetRect(step.TargetId));
         }
     }
 
@@ -485,6 +511,7 @@ public partial class TutorialOverlay : UserControl
         }
 
         _audioCurvePreview = false;
+        BoostPercent = null;
         var cts = _demoCts;
         _demoCts = null;
         if (cts is not null)
@@ -853,7 +880,8 @@ public partial class TutorialOverlay : UserControl
             // ④ 滚轮：改 Q（宽窄）
             SetDemoBadge("滚轮：调 Q，改这一段的宽窄", BadgeAt());
             SetDemoMousePart(DemoMousePart.Wheel);
-            await WheelQualityAsync(id, 1.0, 0.55, token);
+            // 新点的 Q 是按邻居自动定的；3 kHz 空地上落在自适应下限，演示就从这里往窄里压。
+            await WheelQualityAsync(id, EqLimits.MinAutoQuality, 0.55, token);
             await Task.Delay(900, token);
 
             // ⑤ 右键删掉这个点
@@ -939,8 +967,8 @@ public partial class TutorialOverlay : UserControl
     }
 
     /// <summary>
-    /// 自动EQ 那一步：画实测、低音补偿、主层校正，再把光标放到黄色矫正起点线上，左右拖几趟。
-    /// 曲线来自主程序同一套拟合（见 TutorialCalibrationDemo），拖动时按起点插值重画。
+    /// 自动EQ 那一步：不在这里画曲线，直接驱动真实窗口那条黄线。
+    /// 三条线由窗口自己的拟合器和画法算出来，遮罩只负责把光标放到黄线上，左右拖几趟。
     /// </summary>
     private void StartCrossoverDemo(Rect target)
     {
@@ -950,19 +978,6 @@ public partial class TutorialOverlay : UserControl
         }
 
         StopCurveDemo();
-        ResetCurveDemo(target);
-        DemoPanelTitle.Text = "模拟：拖黄线改矫正起点";
-        DemoPanelTitle.HorizontalAlignment = HorizontalAlignment.Right;
-        DemoPanelTitle.VerticalAlignment = VerticalAlignment.Top;
-        DemoPanelTitle.Margin = new Thickness(0, 6, 10, 0);
-        DemoKeyCap.Visibility = Visibility.Collapsed;
-        DemoBadge.Visibility = Visibility.Collapsed;
-        DemoDots.Children.Clear();
-        _demoPoints.Clear();
-        DemoCurvePath.Stroke = new SolidColorBrush(Color.FromRgb(0xFF, 0xA9, 0x4D));
-        DemoMeasuredPath.Stroke = new SolidColorBrush(Color.FromRgb(0x90, 0x90, 0x90));
-        DemoMeasuredPath.Data = BuildDemoCurve(TutorialCalibrationDemo.MeasuredGain);
-        DemoCurvePath.Opacity = 1;
         CursorDot.Visibility = Visibility.Visible;
         DemoMouse.Visibility = Visibility.Visible;
 
@@ -980,7 +995,7 @@ public partial class TutorialOverlay : UserControl
             const double back = 150;
 
             DemoStatus.Text = "黄色虚线是矫正起点：按住它左右拖";
-            await DrawCrossoverAsync(start, token);
+            SetCrossover(start);
             SetDemoMousePart(DemoMousePart.Left);
             await Task.Delay(600, token);
             await PulseAsync();
@@ -994,7 +1009,7 @@ public partial class TutorialOverlay : UserControl
             await DragCrossoverAsync(far, back, 900, token);
             await Task.Delay(450, token);
 
-            DemoStatus.Text = "松手就按新起点重算，不用重测；演示不改你的测量";
+            DemoStatus.Text = "松手就按新起点重算，不用重测";
             SetDemoMousePart(DemoMousePart.None);
             DemoMouse.Visibility = Visibility.Collapsed;
         }
@@ -1006,54 +1021,106 @@ public partial class TutorialOverlay : UserControl
 
     private async Task DragCrossoverAsync(double fromHz, double toHz, int durationMs, CancellationToken token)
     {
-        var frames = Math.Max(1, durationMs / 16);
+        // 窗口那边拖动时本来就按 120 ms 节流重算，这里跟它一个节奏，别把重算排成队。
+        var frames = Math.Max(1, durationMs / 120);
         for (var i = 0; i <= frames; i++)
         {
             token.ThrowIfCancellationRequested();
             var t = i / (double)frames;
             var eased = t * t * (3 - 2 * t);
-            DrawCrossover(fromHz + (toHz - fromHz) * eased);
-            await Task.Delay(16, token);
+            SetCrossover(fromHz + (toHz - fromHz) * eased);
+            await Task.Delay(90, token);
         }
     }
 
-    private async Task DrawCrossoverAsync(double floorHz, CancellationToken token)
+    /// <summary>把矫正起点交给真实窗口，并把光标贴到它挪过去之后的位置上。</summary>
+    private void SetCrossover(double floorHz)
     {
-        DrawCrossover(floorHz);
-        await Task.Delay(1, token);
+        if (CrossoverSet is null)
+        {
+            return;
+        }
+
+        CrossoverSet(floorHz, true);
+        if (CursorAtCrossover?.Invoke() is { } screen && screen.X > 0)
+        {
+            SetDemoCursor(PointFromScreen(screen));
+        }
     }
 
-    /// <summary>按当前矫正起点重画三条线和竖线；拖动时每帧调它。</summary>
-    private void DrawCrossover(double floorHz)
+    /// <summary>
+    /// 左下角「贴合目标 ↔ 保证音量」：把真实滑杆从一头拖到另一头，看曲线怎么换。
+    /// </summary>
+    private void StartBoostDemo(Rect target)
     {
-        floorHz = Math.Clamp(floorHz, 40, 600);
-        var x = DemoPointAt(floorHz, 0).X;
+        if (_closed || BoostSet is null)
+        {
+            return;
+        }
 
-        DemoBassPath.Visibility = Visibility.Visible;
-        DemoBassPath.Data = BuildDemoCurve(
-            hz => TutorialCalibrationDemo.BassGain(floorHz, hz),
-            20,
-            Math.Max(25, floorHz));
-        DemoCurvePath.Data = BuildDemoCurve(
-            hz => TutorialCalibrationDemo.CorrectionGain(floorHz, hz),
-            Math.Max(25, floorHz),
-            TutorialCalibrationDemo.MaxFrequency);
+        StopCurveDemo();
+        CursorDot.Visibility = Visibility.Visible;
+        DemoMouse.Visibility = Visibility.Visible;
+        SetDemoMousePart(DemoMousePart.Left);
 
-        var top = _demoPlot.Top;
-        var bottom = _demoPlot.Bottom;
-        DemoCrossover.Visibility = Visibility.Visible;
-        DemoCrossover.X1 = x;
-        DemoCrossover.X2 = x;
-        DemoCrossover.Y1 = top;
-        DemoCrossover.Y2 = bottom;
+        var cts = new CancellationTokenSource();
+        _demoCts = cts;
+        _ = RunBoostDemoAsync(cts.Token);
+    }
 
-        DemoCrossoverLabel.Visibility = Visibility.Visible;
-        DemoCrossoverLabel.Text = $"矫正起点 {floorHz:0} Hz";
-        Canvas.SetLeft(DemoCrossoverLabel, Math.Min(x + 6, _demoPlot.Right - 96));
-        Canvas.SetTop(DemoCrossoverLabel, top + 2);
+    private async Task RunBoostDemoAsync(CancellationToken token)
+    {
+        try
+        {
+            DemoStatus.Text = "最左：贴合目标，提升全给，整体靠预增益压下来";
+            await SlideBoostAsync(0, token);
+            await Task.Delay(900, token);
 
-        // 光标抓在竖线中上部，和真实窗口里拖线的位置一致。
-        SetDemoCursor(new Point(x, top + (bottom - top) * 0.35));
+            DemoStatus.Text = "中间：只切不补，音量最满、不削波";
+            await SlideBoostAsync(50, token);
+            await Task.Delay(900, token);
+
+            DemoStatus.Text = "往右：提升放回来了，超过 0 dBFS 的会被削掉";
+            await SlideBoostAsync(100, token);
+            DemoStatus.Text = "到头了；再往左就退回只切不补";
+            SetDemoMousePart(DemoMousePart.None);
+            DemoMouse.Visibility = Visibility.Collapsed;
+        }
+        catch (OperationCanceledException)
+        {
+            // 切下一步、跳过或关教程。
+        }
+    }
+
+    /// <summary>一路挪到目标百分比：途中用快速重算，到最后一步再跑一次完整的。</summary>
+    private async Task SlideBoostAsync(double toPercent, CancellationToken token)
+    {
+        var from = BoostPercent ?? 0;
+        var steps = Math.Max(1, (int)Math.Round(Math.Abs(toPercent - from) / 10));
+        for (var i = 1; i <= steps; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var eased = (double)i / steps;
+            SetBoost(from + (toPercent - from) * eased, quick: i < steps);
+            await Task.Delay(160, token);
+        }
+
+        await Task.Delay(220, token);
+    }
+
+    private void SetBoost(double percent, bool quick)
+    {
+        if (BoostSet is null)
+        {
+            return;
+        }
+
+        BoostSet(percent, quick);
+        BoostPercent = percent;
+        if (CursorAtBoost?.Invoke() is { } screen)
+        {
+            SetDemoCursor(PointFromScreen(screen));
+        }
     }
 
     private void ResetCurveDemo(Rect target)
@@ -1872,7 +1939,8 @@ public partial class TutorialOverlay : UserControl
         Spotlight.Visibility = Visibility.Visible;
     }
 
-    /// <summary>气泡淡入 / 淡出：换步骤时先退掉旧文字，等光标到位再浮出新内容。</summary>
+    /// <summary>气泡淡入 / 淡出：换步骤时先退掉旧文字，等光标到位再浮出新内容。
+    /// 连线和气泡同步：同一段透明度动画，连线不会先孤零零地挂出来。</summary>
     private Task FadeBubbleAsync(double target, int milliseconds)
     {
         if (_closed)
@@ -1888,13 +1956,22 @@ public partial class TutorialOverlay : UserControl
 
         animation.Completed += (_, _) =>
         {
-            Bubble.BeginAnimation(OpacityProperty, null);
-            Bubble.Opacity = target;
+            SetBubbleOpacity(target);
             completion.TrySetResult();
         };
 
         Bubble.BeginAnimation(OpacityProperty, animation);
+        LeaderLine.BeginAnimation(OpacityProperty, animation);
         return completion.Task;
+    }
+
+    /// <summary>气泡和连线是一体的：设透明度就一起设，别只改其中一个。</summary>
+    private void SetBubbleOpacity(double value)
+    {
+        Bubble.BeginAnimation(OpacityProperty, null);
+        LeaderLine.BeginAnimation(OpacityProperty, null);
+        Bubble.Opacity = value;
+        LeaderLine.Opacity = value;
     }
 
     /// <summary>演示类步骤：光标已经开始走，等一小会儿再把说明浮出来。</summary>
@@ -1923,8 +2000,9 @@ public partial class TutorialOverlay : UserControl
 
         UpdateLeaderLine(step.Placement, target, position, bubbleHeight);
 
-        Bubble.BeginAnimation(OpacityProperty, null);
-        Bubble.Opacity = 1;
+        // 换步骤时马上会被 SetBubbleOpacity(0) 压回去；这里设成 1 是为了
+        // 遮罩尺寸变化重排气泡时，连线和气泡一起保持原样可见。
+        SetBubbleOpacity(1);
     }
 
     private Point GetBubblePosition(Rect target, double bubbleHeight, TutorialBubblePlacement placement)

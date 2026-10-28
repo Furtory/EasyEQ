@@ -1,13 +1,17 @@
 <Application x:Class="PeaceWpf.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:conv="clr-namespace:PeaceWpf.Converters">
   <Application.Resources>
     <ResourceDictionary>
       <ResourceDictionary.MergedDictionaries>
         <ui:ThemesDictionary Theme="Dark" />
         <ui:ControlsDictionary />
       </ResourceDictionary.MergedDictionaries>
+
+      <!-- 预设下拉：显示时去掉 .peace 后缀，选中的仍然是完整文件名。 -->
+      <conv:PresetNameConverter x:Key="PresetName" />
 
       <!-- 仪表盘面板：设置窗口的三块卡片共用。 -->
       <Style x:Key="DashboardCard" TargetType="Border">

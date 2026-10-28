@@ -124,6 +124,130 @@ public static class ApoSetup
         }
     }
 
+    /// <summary>
+    /// 切换入口文件里的 Include：保证挂上 <paramref name="includeFileName"/>，
+    /// 同时把指向 <paramref name="excludeFileName"/> 的那一行去掉，别的行一个不动
+    /// （`protect.txt`、注释、空行都原样留着）。
+    ///
+    /// 为什么必须二选一：两个文件都挂上，两份 EQ 会叠加，声音就不对了。
+    /// 改之前同样先备份；文件不存在时就新建。
+    /// </summary>
+    public static ApoIncludeResult SwitchInclude(
+        string configDirectory,
+        string includeFileName,
+        string excludeFileName,
+        string backupDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(configDirectory) || !Directory.Exists(configDirectory))
+        {
+            return new ApoIncludeResult(false, "找不到 EqualizerAPO 的 config 目录。", null);
+        }
+
+        if (string.IsNullOrWhiteSpace(includeFileName))
+        {
+            return new ApoIncludeResult(false, "要挂进去的文件名是空的。", null);
+        }
+
+        var path = ConfigFilePath(configDirectory);
+        string? backupPath = null;
+
+        try
+        {
+            var existing = File.Exists(path) ? File.ReadAllText(path) : string.Empty;
+            var newline = existing.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+            var lines = existing.Length == 0
+                ? new List<string>()
+                : existing.Split(newline).ToList();
+
+            while (lines.Count > 0 && lines[^1].Trim().Length == 0)
+            {
+                lines.RemoveAt(lines.Count - 1);
+            }
+
+            var kept = new List<string>(lines.Count + 1);
+            var removed = 0;
+            var alreadyIncluded = false;
+
+            foreach (var line in lines)
+            {
+                if (TryReadIncludeName(line, out var name))
+                {
+                    if (string.Equals(name, excludeFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        removed++;
+                        continue;
+                    }
+
+                    if (string.Equals(name, includeFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        alreadyIncluded = true;
+                    }
+                }
+
+                kept.Add(line);
+            }
+
+            if (alreadyIncluded && removed == 0)
+            {
+                return new ApoIncludeResult(false, null, null);
+            }
+
+            if (!alreadyIncluded)
+            {
+                kept.Add(IncludeKeyword + " " + includeFileName);
+            }
+
+            if (File.Exists(path))
+            {
+                backupPath = Backup(path, backupDirectory);
+                EapoConfig.ClearReadOnly(path);
+            }
+
+            File.WriteAllText(path, string.Join(newline, kept) + newline, new UTF8Encoding(false));
+            return new ApoIncludeResult(true, null, backupPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new ApoIncludeResult(false, ex.Message, backupPath);
+        }
+    }
+
+    /// <summary>
+    /// 把一行里的 Include 目标文件名读出来（`Include: 子目录\文件.txt` 只取最后一段），
+    /// 不是 Include 行返回 false。空行和 `#` 注释也算不是。
+    /// </summary>
+    private static bool TryReadIncludeName(string rawLine, out string name)
+    {
+        name = string.Empty;
+
+        var line = rawLine.Trim();
+        if (line.Length == 0 || line.StartsWith('#'))
+        {
+            return false;
+        }
+
+        if (!line.StartsWith(IncludeKeyword, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var target = line[IncludeKeyword.Length..].Trim().Trim('"');
+        if (target.Length == 0)
+        {
+            return false;
+        }
+
+        var normalized = target.Replace('\\', '/');
+        var slash = normalized.LastIndexOf('/');
+        if (slash >= 0)
+        {
+            normalized = normalized[(slash + 1)..];
+        }
+
+        name = normalized;
+        return true;
+    }
+
     /// <summary>读入口文件的文本；读不了返回 null，不抛。</summary>
     public static string? TryRead(string configDirectory)
     {

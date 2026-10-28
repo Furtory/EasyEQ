@@ -5,11 +5,11 @@ cd /d "%~dp0"
 rem 保存要写 EqualizerAPO 的 peace.txt。DSH 会话的文件沙箱会挡住从工作区启动的程序写工作区外，
 rem 所以这里把构建产物复制到 %LOCALAPPDATA% 再从那里启动；正常安装后不需要这一步。
 set SRC=src\PeaceWpf\bin\Debug\net10.0-windows
-set DST=%LOCALAPPDATA%\PeaceWpf\app
-set EXE=%DST%\PeaceWpf.exe
+set DST=%LOCALAPPDATA%\EasyEQ\app
+set EXE=%DST%\EasyEQ.exe
 set ERRLOG=%DST%\startup-error.log
 
-if not exist "%SRC%\PeaceWpf.exe" (
+if not exist "%SRC%\EasyEQ.exe" (
     echo exe not found. run build.cmd first.
     pause
     exit /b 1

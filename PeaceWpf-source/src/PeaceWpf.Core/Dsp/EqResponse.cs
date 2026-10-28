@@ -55,6 +55,94 @@ public static class EqResponse
         return sum;
     }
 
+    /// <summary>
+    /// 除某颗推子之外，其它推子在给定频率上的总增益（dB）。
+    /// 曲线是各段 dB 直接相加画出来的（见 <see cref="GainAt"/>），所以这里也直接相加。
+    /// </summary>
+    public static double OthersGainAt(EqPointList points, double frequencyHz, int? excludeId = null)
+    {
+        ArgumentNullException.ThrowIfNull(points);
+
+        var sum = 0.0;
+        foreach (var point in points.Points)
+        {
+            if (excludeId is { } id && point.Id == id)
+            {
+                continue;
+            }
+
+            sum += BandGain(BandOf(point), frequencyHz);
+        }
+
+        return sum;
+    }
+
+    /// <summary>
+    /// 反推增益：把这颗推子的圆心放在 <paramref name="frequencyHz"/> 上，要它在该点贡献
+    /// <paramref name="wantedDb"/>，总增益该设多少。
+    ///
+    /// 峰值滤波器在中心处贡献就等于增益；架式在拐点只给一半，所以不能照抄，得解。
+    /// 架式和峰值的响应都随增益单调，二分一定收敛。
+    /// </summary>
+    public static double GainForContribution(EqPoint template, double frequencyHz, double wantedDb)
+    {
+        ArgumentNullException.ThrowIfNull(template);
+
+        if (!double.IsFinite(frequencyHz) || frequencyHz <= 0 || !double.IsFinite(wantedDb))
+        {
+            return 0;
+        }
+
+        var low = EqLimits.MinGainDb;
+        var high = EqLimits.MaxGainDb;
+        for (var i = 0; i < 50; i++)
+        {
+            var mid = (low + high) / 2;
+            var band = BandOf(template with { FrequencyHz = frequencyHz, GainDb = mid });
+            if (BandGain(band, frequencyHz) < wantedDb)
+            {
+                low = mid;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        return (low + high) / 2;
+    }
+
+    /// <summary>
+    /// 让整条曲线在 <paramref name="frequencyHz"/> 处正好经过 <paramref name="targetDb"/>：
+    /// 先扣掉别的推子在同一点的贡献，再反推这颗推子该有的增益。拖曲线改推子就靠它。
+    /// </summary>
+    public static double GainForCurveThrough(EqPointList points, int id, double frequencyHz, double targetDb)
+    {
+        ArgumentNullException.ThrowIfNull(points);
+
+        var point = points.Find(id);
+        if (point is null)
+        {
+            return 0;
+        }
+
+        var wanted = targetDb - OthersGainAt(points, frequencyHz, id);
+        return GainForContribution(point, frequencyHz, wanted);
+    }
+
+    /// <summary>
+    /// 新建一颗推子时同样压在鼠标上：新点是峰值，在自己中心处贡献就等于增益，扣掉别人的就行。
+    /// </summary>
+    public static double GainForNewPointAt(EqPointList points, double frequencyHz, double targetDb)
+    {
+        ArgumentNullException.ThrowIfNull(points);
+        return targetDb - OthersGainAt(points, frequencyHz);
+    }
+
+    /// <summary>点模型转仿真需要的单段。索引和开关不影响单段响应。</summary>
+    private static SliderBand BandOf(EqPoint point) =>
+        new(0, point.FrequencyHz, point.GainDb, point.Quality, point.FilterType, true);
+
     /// <summary>单段在给定频率处的增益，单位 dB。</summary>
     public static double BandGain(SliderBand band, double frequencyHz)
     {

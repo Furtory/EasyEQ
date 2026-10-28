@@ -6,6 +6,7 @@
                  xmlns:conv="clr-namespace:PeaceWpf.Converters"
                  xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
                  Title="电竞调音台"
+                 Icon="Assets/EasyEQ.ico"
                  Width="1280"
                  Height="720"
                  MinWidth="1120"
@@ -560,11 +561,23 @@
               Grid.Row="0"
               Background="Transparent"
               MouseLeftButtonDown="OnTitleBarMouseDown">
-            <TextBlock Text="电竞调音台"
-                       VerticalAlignment="Center"
-                       Margin="18,0,0,0"
-                       FontSize="14"
-                       FontWeight="SemiBold" />
+            <!-- 左上角这枚小标同时是启动动画的落点：大 LOGO 从正中飞到这里停住，
+                 遮罩淡出后它就是标题栏里的常驻图标，交接看不出断点。 -->
+            <StackPanel Orientation="Horizontal"
+                        VerticalAlignment="Center"
+                        Margin="18,0,0,0">
+                <Image x:Name="TitleLogo"
+                       Width="22"
+                       Height="22"
+                       Source="Assets/logo.png"
+                       RenderOptions.BitmapScalingMode="HighQuality" />
+                <TextBlock x:Name="TitleLogoText"
+                           Text="电竞调音台"
+                           VerticalAlignment="Center"
+                           Margin="10,0,0,0"
+                           FontSize="14"
+                           FontWeight="SemiBold" />
+            </StackPanel>
 
             <StackPanel Orientation="Horizontal"
                         HorizontalAlignment="Right"
@@ -623,6 +636,11 @@
                           SelectedItem="{Binding SelectedMainPreset, Mode=TwoWay}"
                           DropDownClosed="OnPresetDropDownClosed"
                           ToolTip="左右声道用哪套预设；右键可改名、复制、删除；按住右侧 ⋮⋮ 可拖动排序">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Converter={StaticResource PresetName}}" />
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
                     <ComboBox.ContextMenu>
                         <ContextMenu>
                             <MenuItem Header="重命名…" Click="OnPresetMenuRename" />
@@ -659,6 +677,11 @@
                           SelectedItem="{Binding SelectedBassPreset, Mode=TwoWay}"
                           DropDownClosed="OnPresetDropDownClosed"
                           ToolTip="低音层用哪套预设；右键可改名、复制、删除；按住右侧 ⋮⋮ 可拖动排序">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Converter={StaticResource PresetName}}" />
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
                     <ComboBox.ContextMenu>
                         <ContextMenu>
                             <MenuItem Header="重命名…" Click="OnPresetMenuRename" />
@@ -712,12 +735,66 @@
                         Orientation="Horizontal"
                         HorizontalAlignment="Right"
                         VerticalAlignment="Center">
+                <Button x:Name="SweepSmoothButton"
+                        Content="平滑 关"
+                        Padding="6,4"
+                        Margin="0,0,4,0"
+                        VerticalAlignment="Center"
+                        Click="OnSweepSmoothNext"
+                        ToolTip="点一次提高一档：关 → 1/24 → 1/12 → 1/6 倍频程。只影响画出来的样子，尖峰太窄会被磨平，判断驻波请看关档或合并线" />
+
+                <Border Background="#1E1E1E"
+                        BorderBrush="#33808080"
+                        BorderThickness="1"
+                        CornerRadius="4"
+                        Margin="0,0,4,0"
+                        VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBox x:Name="SweepSecondsBox"
+                                 Width="30"
+                                 Text="10"
+                                 MaxLength="2"
+                                 TextAlignment="Right"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 Padding="4,3,0,3"
+                                 VerticalContentAlignment="Center"
+                                 LostFocus="OnSweepSecondsCommit"
+                                 KeyDown="OnSweepSecondsKeyDown"
+                                 ToolTip="扫频时长（秒），2–99。越长低频越准，等待也越久" />
+                        <TextBlock Text="秒"
+                                   VerticalAlignment="Center"
+                                   Margin="2,0,6,0"
+                                   Foreground="#AAFFFFFF" />
+                    </StackPanel>
+                </Border>
+                <StackPanel Orientation="Vertical"
+                            VerticalAlignment="Center"
+                            Margin="0,0,8,0">
+                    <Button Content="▲"
+                            Width="16"
+                            Height="11"
+                            FontSize="6"
+                            Padding="0"
+                            Click="OnSweepSecondsUp"
+                            ToolTip="加 1 秒" />
+                    <Button Content="▼"
+                            Width="16"
+                            Height="11"
+                            FontSize="6"
+                            Padding="0"
+                            Click="OnSweepSecondsDown"
+                            ToolTip="减 1 秒" />
+                </StackPanel>
+
                 <Button Content="扫频"
                         AutomationProperties.AutomationId="SweepButton"
                         Click="OnPlaySweep"
+                        MouseDown="OnSweepMiddleClick"
+                        MouseRightButtonDown="OnSweepClear"
                         Padding="12,6"
                         Margin="0,0,8,0"
-                        ToolTip="放一遍 5 秒扫频（20 Hz 一路升到 20 kHz），听到的就是现在这套 EQ。叠不叠低音看「叠加低音修正」的勾选；放完自动还原" />
+                        ToolTip="放一遍扫频（20 Hz 一路升到 20 kHz），同时录一遍并画成绿色曲线，最多留 5 条，旧的变暗。中键把已有的曲线合并（用来分辨驻波），右键清空。听到的就是现在这套 EQ；叠不叠低音看「叠加低音修正」的勾选" />
 
                 <Button Content="预设EQ"
                         AutomationProperties.AutomationId="AutoEqButton"
@@ -726,11 +803,19 @@
                         ToolTip="按耳机型号套用现成的校正曲线（数据来自 AutoEQ 库）" />
 
                 <Button Content="自动EQ"
+                        x:Name="AutoCalibrateButton"
                         AutomationProperties.AutomationId="AutoCalibrateButton"
                         Click="OnOpenAutoCalibrate"
                         Padding="12,6"
                         Margin="8,0,0,0"
                         ToolTip="用麦克风实际测一次，测出设备或房间的声音特点，再自动帮你补平" />
+
+                <Button Content="自动切换"
+                        AutomationProperties.AutomationId="AutoSwitchButton"
+                        Click="OnOpenAutoSwitch"
+                        Padding="12,6"
+                        Margin="8,0,0,0"
+                        ToolTip="把「左右 + 低音 + 叠加开关」存成一组：按热键或切到绑定的进程时自动套用" />
             </StackPanel>
         </Grid>
 
@@ -746,7 +831,7 @@
                               Points="{Binding Points}"
                               ReferencePoints="{Binding ReferencePoints}"
                               GainRange="{Binding GainRangeDb}"
-                              PreAmpDb="{Binding PreAmpDb}"
+                              PreAmpDb="{Binding GraphPreAmpDb}"
                               IsEditable="{Binding IsEditable}"
                               Spectrum="{Binding Spectrum}"
                               Flavors="{Binding Flavors}"
@@ -754,10 +839,12 @@
                               SelectedFlavorIndex="{Binding SelectedFlavorIndex}"
                               FlavorHandlesInteractive="{Binding IsFlavorEditable}"
                               BassEditing="{Binding IsBassLayerMode}"
+                              BassOverlayEnabled="{Binding IsBassLayerEnabled}"
                               CreatePointRequested="OnCreatePointRequested"
                               PointMovePreview="OnPointMovePreview"
                               PointMoveCommitted="OnPointMoveCommitted"
                               PointDeleteRequested="OnPointDeleteRequested"
+                              PointResetRequested="OnPointResetRequested"
                               QualityChanged="OnQualityChanged"
                               FlavorSelected="OnFlavorSelected"
                               FlavorFrequencyPreview="OnFlavorFrequencyPreview"
@@ -797,7 +884,7 @@
                         Minimum="-20"
                         Maximum="20"
                         TickFrequency="0.5"
-                        IsEnabled="{Binding IsApoFound}"
+                        IsEnabled="{Binding IsPreampEnabled}"
                         Value="{Binding PreAmpDb, Mode=TwoWay}"
                         PreviewMouseRightButtonDown="OnPreampReset"
                         Margin="0,8,0,8"
@@ -974,6 +1061,43 @@
                 </DockPanel>
             </Grid>
         </Border>
+
+        <!-- 启动遮罩：纯黑盖住整块界面（跨满四行），LOGO 正中，软件名在它下面。
+             启动后 LOGO 缩小飞向左上角，遮罩淡出，控件才露出来。 -->
+        <Grid x:Name="SplashLayer"
+              Grid.Row="0"
+              Grid.RowSpan="4"
+              Background="#FF000000"
+              Opacity="1">
+            <!-- LOGO 严格居中；软件名用 Margin 挂在它下面，不参与居中计算。 -->
+            <Grid x:Name="SplashGroup"
+                  HorizontalAlignment="Center"
+                  VerticalAlignment="Center">
+                <Image x:Name="SplashLogo"
+                       Width="132"
+                       Height="132"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       Source="Assets/logo.png"
+                       RenderOptions.BitmapScalingMode="HighQuality"
+                       RenderTransformOrigin="0.5,0.5">
+                    <Image.RenderTransform>
+                        <TransformGroup>
+                            <ScaleTransform x:Name="SplashScale" ScaleX="1" ScaleY="1" />
+                            <TranslateTransform x:Name="SplashShift" X="0" Y="0" />
+                        </TransformGroup>
+                    </Image.RenderTransform>
+                </Image>
+                <TextBlock x:Name="SplashTitle"
+                           Text="电竞调音台"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Margin="0,206,0,0"
+                           FontSize="26"
+                           FontWeight="SemiBold"
+                           Foreground="#FFF5F5F5" />
+            </Grid>
+        </Grid>
 
     </Grid>
 </ui:FluentWindow>

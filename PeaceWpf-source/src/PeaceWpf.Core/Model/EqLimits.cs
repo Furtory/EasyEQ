@@ -43,8 +43,18 @@ public static class EqLimits
     /// <summary>曲线频率轴的右端。</summary>
     public const double MaxEditableFrequencyHz = 20000;
 
-    /// <summary>新建推子时的默认 Q。</summary>
+    /// <summary>新建推子时的默认 Q。邻居间距算不出更有意义的值时退回它。</summary>
     public const double DefaultQuality = 1.41;
+
+    /// <summary>
+    /// 按邻居间距自适应挑 Q 时的下限。再宽就糊成一片，听不出是哪个频段在动。
+    /// </summary>
+    public const double MinAutoQuality = 0.7;
+
+    /// <summary>
+    /// 按邻居间距自适应挑 Q 时的上限。旁边挤得再近，也别细成一根针。
+    /// </summary>
+    public const double MaxAutoQuality = 6.0;
 
     /// <summary>界面上允许的最小 Q。引擎下限是 0.01，这里留一点余量避免除零。</summary>
     public const double MinQuality = 0.10;

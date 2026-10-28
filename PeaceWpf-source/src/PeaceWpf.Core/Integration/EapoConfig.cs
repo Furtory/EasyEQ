@@ -16,6 +16,16 @@ public static partial class EapoConfig
     /// <summary>Peace 使用的配置文件。</summary>
     public const string FileName = "peace.txt";
 
+    /// <summary>独立模式下本程序自己的配置文件；Peace 不认这个名字，不会碰它。</summary>
+    public const string IndependentFileName = "easyeq.txt";
+
+    /// <summary>
+    /// 按「独立模式」挑配置文件名。关闭时写 peace.txt（Peace 也读它），
+    /// 打开时写 easyeq.txt（两个程序各写各的，互不覆盖）。
+    /// </summary>
+    public static string FileNameFor(bool independent) =>
+        independent ? IndependentFileName : FileName;
+
     /// <summary>平衡到端点时衰减多少 dB。</summary>
     public const double BalanceMaxDb = 12.0;
 

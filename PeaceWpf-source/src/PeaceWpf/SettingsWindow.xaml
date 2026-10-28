@@ -95,7 +95,7 @@
 
             <!-- ============ 1. 运行环境 ============ -->
             <Border Grid.Column="0" Style="{StaticResource DashboardCard}" Margin="0,0,7,0">
-                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <ScrollViewer VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Disabled">
                     <StackPanel>
                         <StackPanel Orientation="Horizontal">
                             <TextBlock FontFamily="Segoe MDL2 Assets"
@@ -121,56 +121,86 @@
                                        Text="未检测到 EqualizerAPO" />
                         </StackPanel>
 
-                        <!-- ② 安装按钮 -->
+                        <!-- ② 安装按钮：与「重新连接」同宽同对齐 -->
                         <Button Content="安装 EqualizerAPO"
                                 Click="OnInstallApo"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
                                 Margin="0,0,0,14"
                                 ToolTip="自动下载官方安装包并拉起安装程序" />
 
                         <!-- ③ 连接状态 -->
                         <TextBlock Text="连接状态" Style="{StaticResource SectionLabel}" />
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <TextBlock Style="{StaticResource ApoStatusDot}" />
                             <TextBlock Style="{StaticResource ApoStatusText}" Margin="6,0,0,0" />
                         </StackPanel>
+                        <!-- 环境：静态事实，回答「为什么保存了没效果」 -->
+                        <TextBlock Text="{Binding EnvironmentSummary}"
+                                   Style="{StaticResource Hint}"
+                                   Margin="0,0,0,10" />
 
-                        <!-- 状态与提示（原窗口底部那块，挪到连接状态下面） -->
+                        <!-- ④ 重新连接：紧接状态行，与下面调试框同宽，文字居中 -->
+                        <Button Content="重新连接"
+                                Click="OnRecheckApo"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
+                                Margin="0,0,0,12" />
+
+                        <!-- 调试信息：曲线 / 动作 / 警告 / 错误 -->
+                        <TextBlock Text="调试信息" Style="{StaticResource SectionLabel}" />
                         <Border Background="#0AFFFFFF"
                                 CornerRadius="8"
                                 Padding="10,8"
                                 Margin="0,0,0,12"
                                 AutomationProperties.AutomationId="SettingsStatus">
                             <StackPanel>
-                                <TextBlock Text="{Binding StatusText}"
+                                <TextBlock Text="曲线"
+                                           FontSize="11"
+                                           Opacity="0.5"
+                                           Margin="0,0,0,2" />
+                                <TextBlock Text="{Binding CurveSummary}"
+                                           FontSize="11"
+                                           TextWrapping="Wrap"
+                                           Margin="0,0,0,8" />
+
+                                <TextBlock Text="动作"
+                                           FontSize="11"
+                                           Opacity="0.5"
+                                           Margin="0,0,0,2" />
+                                <TextBlock Text="{Binding ActionsSummary}"
                                            FontSize="11"
                                            TextWrapping="Wrap"
                                            MaxHeight="70"
-                                           TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="{Binding PeaceOverflowHint}"
+                                           TextTrimming="CharacterEllipsis"
+                                           Margin="0,0,0,8" />
+
+                                <TextBlock Text="警告"
                                            FontSize="11"
-                                           Foreground="#FFD08A2B"
-                                           TextWrapping="Wrap" />
-                                <TextBlock Text="{Binding NonPeakingHint}"
+                                           Opacity="0.5"
+                                           Margin="0,0,0,2" />
+                                <TextBlock Text="{Binding WarningsSummary}"
                                            FontSize="11"
                                            Foreground="#FFD08A2B"
                                            TextWrapping="Wrap"
-                                           Visibility="{Binding HasNonPeakingFilters, Converter={StaticResource BoolToVis}}" />
-                                <TextBlock Text="{Binding SpectrumHint}"
+                                           Margin="0,0,0,8" />
+
+                                <TextBlock Text="错误"
                                            FontSize="11"
-                                           Opacity="0.55"
+                                           Opacity="0.5"
+                                           Margin="0,0,0,2" />
+                                <TextBlock Text="{Binding ErrorsSummary}"
+                                           FontSize="11"
+                                           Foreground="#FFE85A5A"
                                            TextWrapping="Wrap" />
-                                <Button Content="复制状态"
-                                        Click="OnCopyStatus"
-                                        HorizontalAlignment="Left"
-                                        Padding="8,2"
-                                        FontSize="11"
-                                        Margin="0,6,0,0" />
                             </StackPanel>
                         </Border>
 
-                        <!-- ④ 重新检查并连接 -->
-                        <Button Content="重新检查并连接"
-                                Click="OnRecheckApo"
+                        <!-- 复制调试信息：和重新连接同一套样式，放在框外面 -->
+                        <Button Content="复制调试信息"
+                                Click="OnCopyStatus"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
                                 Margin="0,0,0,14" />
 
                         <!-- ⑤ 配置文件夹：输入框 + 选择 -->
@@ -215,53 +245,92 @@
 
             <!-- ============ 2. 常规设置 ============ -->
             <Border Grid.Column="1" Style="{StaticResource DashboardCard}" Margin="7,0">
-                <StackPanel>
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock FontFamily="Segoe MDL2 Assets"
-                                   Text="&#xE713;"
-                                   FontSize="16"
-                                   Foreground="#FF4CC2FF"
-                                   VerticalAlignment="Center" />
-                        <TextBlock Text="常规设置"
-                                   Style="{StaticResource PanelTitle}"
-                                   Margin="10,0,0,0"
-                                   VerticalAlignment="Center" />
+                <ScrollViewer VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets"
+                                       Text="&#xE713;"
+                                       FontSize="16"
+                                       Foreground="#FF4CC2FF"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Text="常规设置"
+                                       Style="{StaticResource PanelTitle}"
+                                       Margin="10,0,0,0"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <Border Height="1" Background="#FF2E2E2E" Margin="0,14,0,14" />
+
+                        <TextBlock Text="配置保存" Style="{StaticResource SectionLabel}" />
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" Content="导出设置" Click="OnExportSettings"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                    Margin="0,0,4,0" />
+                            <Button Grid.Column="1" Content="导入设置" Click="OnImportSettings"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                                    Margin="4,0,0,0" />
+                        </Grid>
+
+                        <Border Height="1" Background="#FF2E2E2E" Margin="0,0,0,14" />
+
+                        <TextBlock Text="独立模式" Style="{StaticResource SectionLabel}" />
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <ui:ToggleSwitch x:Name="IndependentModeSwitch"
+                                             Checked="OnIndependentModeChecked"
+                                             Unchecked="OnIndependentModeUnchecked" />
+                            <TextBlock Text="独立模式"
+                                       FontSize="12"
+                                       Margin="10,0,0,0"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                        <TextBlock x:Name="IndependentModeHint"
+                                   Style="{StaticResource Hint}"
+                                   Text="打开后不控制 Peace，不使用 Peace 也可以打开。"
+                                   Margin="0,0,0,14" />
+
+                        <Border Height="1" Background="#FF2E2E2E" Margin="0,0,0,14" />
+
+                        <TextBlock Text="开机自启" Style="{StaticResource SectionLabel}" />
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <ui:ToggleSwitch x:Name="AutoStartSwitch"
+                                             Checked="OnAutoStartChecked"
+                                             Unchecked="OnAutoStartUnchecked" />
+                            <TextBlock Text="开机时自动启动"
+                                       FontSize="12"
+                                       Margin="10,0,0,0"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <ui:ToggleSwitch x:Name="ShowOnStartSwitch"
+                                             Checked="OnShowOnStartChecked"
+                                             Unchecked="OnShowOnStartUnchecked" />
+                            <TextBlock Text="启动时显示界面"
+                                       FontSize="12"
+                                       Margin="10,0,0,0"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <Border Height="1" Background="#FF2E2E2E" Margin="0,14,0,14" />
+
+                        <!-- 退出行为：这里一改就记住，之后关窗口不再问 -->
+                        <TextBlock Text="退出行为" Style="{StaticResource SectionLabel}" />
+                        <RadioButton x:Name="CloseExitRadio"
+                                     GroupName="CloseBehavior"
+                                     Margin="0,0,0,10"
+                                     Checked="OnCloseExitChecked">
+                            <TextBlock Text="退出软件" FontSize="12" />
+                        </RadioButton>
+                        <RadioButton x:Name="CloseTrayRadio"
+                                     GroupName="CloseBehavior"
+                                     Checked="OnCloseTrayChecked">
+                            <TextBlock Text="最小化到托盘" FontSize="12" />
+                        </RadioButton>
                     </StackPanel>
-
-                    <Border Height="1" Background="#FF2E2E2E" Margin="0,14,0,14" />
-
-                    <TextBlock Text="配置保存" Style="{StaticResource SectionLabel}" />
-                    <Grid Margin="0,0,0,16">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <Button Grid.Column="0" Content="导出设置" Click="OnExportSettings" Margin="0,0,4,0" />
-                        <Button Grid.Column="1" Content="导入设置" Click="OnImportSettings" Margin="4,0,0,0" />
-                    </Grid>
-
-                    <Border Height="1" Background="#FF2E2E2E" Margin="0,0,0,14" />
-
-                    <TextBlock Text="开机自启" Style="{StaticResource SectionLabel}" />
-                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-                        <ui:ToggleSwitch x:Name="AutoStartSwitch"
-                                         Checked="OnAutoStartChecked"
-                                         Unchecked="OnAutoStartUnchecked" />
-                        <TextBlock Text="开机时自动启动"
-                                   FontSize="12"
-                                   Margin="10,0,0,0"
-                                   VerticalAlignment="Center" />
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal">
-                        <ui:ToggleSwitch x:Name="ShowOnStartSwitch"
-                                         Checked="OnShowOnStartChecked"
-                                         Unchecked="OnShowOnStartUnchecked" />
-                        <TextBlock Text="启动时显示界面"
-                                   FontSize="12"
-                                   Margin="10,0,0,0"
-                                   VerticalAlignment="Center" />
-                    </StackPanel>
-                </StackPanel>
+                </ScrollViewer>
             </Border>
 
             <!-- ============ 3. 关于软件 ============ -->

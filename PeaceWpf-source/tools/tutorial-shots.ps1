@@ -211,58 +211,55 @@ if (-not $next) { throw '基础课气泡没出现，或下一步一直不可用'
 Start-Sleep -Milliseconds 300
 Shot-Screen $p.MainWindowHandle (Join-Path $out '18-tutorial-basic.png')
 
-# 第 2 步：设置窗口里的状态
-Click-Next $overlay '打开设置'
-$settingsHandle = Wait-Window $p.Id '设置'
-if ($settingsHandle -eq [IntPtr]::Zero) { throw '教程没打开设置窗口' }
-Start-Sleep -Milliseconds 300
-Shot-Screen $p.MainWindowHandle (Join-Path $out '21-tutorial-settings.png')
-
-# 第 3 步：设置里的配置目录；第 4 步回主界面；第 5 步打开预设EQ
-Click-Next $overlay '设置第 3 步'
-Click-Next $overlay '回主界面'
+# 第 2 步：预设EQ 窗口里的搜索框（第 1 步指主界面「预设EQ」）
 Click-Next $overlay '打开预设EQ'
-$autoEqHandle = Wait-Window $p.Id '预设EQ'
-if ($autoEqHandle -eq [IntPtr]::Zero) { throw '教程没打开预设EQ窗口' }
+$presetEqHandle = Wait-Window $p.Id '预设EQ'
+if ($presetEqHandle -eq [IntPtr]::Zero) { throw '教程没打开预设EQ窗口' }
 Start-Sleep -Milliseconds 300
 Shot-Screen $p.MainWindowHandle (Join-Path $out '22-tutorial-presseq.png')
 
-# 第 6 步：预设EQ 里只讲搜索；第 7 步回主界面点自动EQ，弹出「校准到哪条曲线」
-Click-Next $overlay '预设EQ 搜索第 6 步'
+# 第 3 步回主界面，第 4 步点自动EQ 弹出「校准到哪条曲线」
+Click-Next $overlay '预设EQ 搜索第 2 步'
 Click-Next $overlay '打开自动EQ'
 $targetHandle = Wait-Window $p.Id '自动EQ · 校准到哪条曲线'
 if ($targetHandle -eq [IntPtr]::Zero) { throw '教程没打开校准目标窗口' }
 Start-Sleep -Milliseconds 300
 Shot-Screen $p.MainWindowHandle (Join-Path $out '25-tutorial-target.png')
 
-# 第 8、9 步：平直 / 哈曼两张卡；选完窗口关掉，进测量窗口
-Click-Next $overlay '平直曲线第 8 步'
-Click-Next $overlay '哈曼曲线第 9 步'
+# 第 4、5 步：平直 / 哈曼两张卡；选完窗口关掉，进测量窗口
+Click-Next $overlay '平直曲线第 4 步'
+Click-Next $overlay '哈曼曲线第 5 步'
 if (-not (Wait-NoWindow $p.Id '自动EQ · 校准到哪条曲线')) { throw '选完目标后校准窗口没关' }
 $calibrateHandle = Wait-Window $p.Id '自动EQ · 扫频校准'
 if ($calibrateHandle -eq [IntPtr]::Zero) { throw '教程没打开自动EQ窗口' }
 Start-Sleep -Milliseconds 300
 Shot-Screen $p.MainWindowHandle (Join-Path $out '23-tutorial-calibrate.png')
 
-# 第 10~13 步都在测量窗口里：测试模式 → 矫正起点 → 开始测量 → 套用
-for ($i = 0; $i -lt 4; $i++) {
-    Click-Next $overlay ("自动EQ 第 $($i + 10) 步")
+# 第 6~11 步都在测量窗口里：麦克风 → 测试模式 → 矫正起点 → 科学矫正 → 开始测量 → 套用
+$calibrate = [System.Windows.Automation.AutomationElement]::FromHandle($calibrateHandle)
+for ($i = 0; $i -lt 5; $i++) {
+    Click-Next $overlay ("自动EQ 第 $($i + 7) 步")
     if ($i -eq 1) {
-        $autoEqCurve = Find-ById $overlay 'DemoPanelTitle'
-        if (-not $autoEqCurve -or $autoEqCurve.Current.Name -ne '模拟：拖黄线改矫正起点') {
-            $name = if ($autoEqCurve) { $autoEqCurve.Current.Name } else { '找不到曲线标题' }
-            throw ('自动EQ看曲线步骤没有显示模拟曲线：' + $name)
-        }
+        # 曲线不再由遮罩另画：曲线区必须来自真实窗口（黄线、实测、校正都在里面）
+        $plot = Find-ById $calibrate 'CalibratePlot'
+        if (-not $plot) { throw '自动EQ看曲线步骤：真实窗口里没有曲线区' }
         Shot-Screen $p.MainWindowHandle (Join-Path $out '28-tutorial-autoeq-curve.png')
-        Write-Output 'AutoEQ simulated curve shown'
+        Write-Output 'AutoEQ real-window curve shown'
+    }
+    if ($i -eq 2) {
+        $boost = Find-ById $calibrate 'CalibrateBoostSlider'
+        if (-not $boost) { throw '科学矫正步骤：真实窗口里没有左下角滑杆' }
+        Start-Sleep -Milliseconds 600
+        Shot-Screen $p.MainWindowHandle (Join-Path $out '29-tutorial-science.png')
+        Write-Output 'science correction slider shown'
     }
 }
 
-Invoke-ById $overlay 'TutorialSkipButton' '跳过按钮'
-if (-not (Wait-NoWindow $p.Id '教程 · 引导')) { throw '跳过之后遮罩没消失' }
-if (-not (Wait-NoWindow $p.Id '设置')) { throw '跳过之后设置窗口没关' }
-if (-not (Wait-NoWindow $p.Id '预设EQ')) { throw '跳过之后预设EQ窗口没关' }
-if (-not (Wait-NoWindow $p.Id '自动EQ')) { throw '跳过之后自动EQ窗口没关' }
+# 最后一步的按钮变成「完成」：点它收尾，遮罩和教程打开的窗口一起关掉
+Invoke-ById $overlay 'TutorialNextButton' '完成按钮'
+if (-not (Wait-NoWindow $p.Id '教程 · 引导')) { throw '完成之后遮罩没消失' }
+if (-not (Wait-NoWindow $p.Id '预设EQ')) { throw '完成之后预设EQ窗口没关' }
+if (-not (Wait-NoWindow $p.Id '自动EQ')) { throw '完成之后自动EQ窗口没关' }
 Write-Output 'basic tour closed'
 
 # 3. 进阶课：第一屏
@@ -333,8 +330,17 @@ Start-Sleep -Milliseconds 1600
 Shot-Screen $p.MainWindowHandle (Join-Path $out '32-tutorial-flavor.png')
 Write-Output 'flavor curve shown'
 
+# 第 10 步：自动切换：气泡指按钮 → 组合窗口打开（空组合时挂一行教程演示）
+Click-Next $overlay '进阶课第 10 步'
+$autoSwitch = Wait-Window $p.Id '自动切换'
+if ($autoSwitch -eq [IntPtr]::Zero) { throw '进阶课第 10 步组合窗口没出现' }
+Start-Sleep -Milliseconds 600
+Shot-Screen $p.MainWindowHandle (Join-Path $out '34-tutorial-autoswitch.png')
+Write-Output 'auto switch window shown'
+
 Invoke-ById $overlay 'TutorialSkipButton' '跳过按钮'
 if (-not (Wait-NoWindow $p.Id '教程 · 引导')) { throw '进阶课跳过之后遮罩没消失' }
+if (-not (Wait-NoWindow $p.Id '自动切换')) { throw '跳过之后组合窗口没关' }
 Write-Output 'advanced tour closed'
 
 # 4. 教程关掉以后，设置仍能打开

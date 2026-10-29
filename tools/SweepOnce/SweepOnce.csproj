@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    命令行跑一次扫频测量，用来做引擎对比：不开 WPF，直接调 PeaceWpf.Core 的测量服务。
+
+    用法：
+      dotnet run (project tools/SweepOnce)                 默认：单频相干 + 低频加长
+      dotnet run (project tools/SweepOnce) legacy          旧引擎：宽带 RMS + 均匀时间表
+
+    两次都会把逐点结果写进 %LOCALAPPDATA%\EasyEQ\sweep-last.txt（和界面里测量时同一份）。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SweepOnce</AssemblyName>
+    <RootNamespace>SweepOnce</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PeaceWpf.Core\PeaceWpf.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,2 +1,7 @@
-# Auto detect text files and perform LF normalization
+# 文本文件按内容自动识别；下面两条让 Windows 脚本固定以 CRLF 检出。
+# 为什么：cmd 解析 LF-only 的批处理会丢字符、把括号块拆坏；PowerShell 5.1
+# 读无 BOM 的 UTF-8 会按 ANSI 解码，tools 下的 ps1 因此带 BOM。
 * text=auto
+
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

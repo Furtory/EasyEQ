@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- 托盘图标只有 WinForms 的 NotifyIcon 能用（WPF 没有托盘 API），
+         它在 WindowsDesktop 运行时里，不引第三方包。 -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>PeaceWpf</RootNamespace>
+    <!-- 产物就叫 EasyEQ.exe；命名空间保持 PeaceWpf 不动，免得全工程连锁改名。 -->
+    <AssemblyName>EasyEQ</AssemblyName>
+    <!-- exe 文件图标 -->
+    <ApplicationIcon>Assets\EasyEQ.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SelfContained>false</SelfContained>
+    <!-- WinForms 分析器会劝把 app.manifest 里的 DPI 设置搬到 SetHighDpiMode；
+         但这个程序是 WPF 的，从不调用 WinForms 的 Application.Run，DPI 归 WPF 管。 -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+    <!-- 关于面板显示的版本号；改这里一处，程序里读到的跟着变。 -->
+    <Version>1.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinForms SDK 会把 System.Drawing / System.Windows.Forms 塞进全局 using，
+         跟 WPF 的 Pen / Brush / Point / Size 撞名。托盘只有 TrayIconService 一个文件用，
+         它自己 using，这里把全局引入摘掉。 -->
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WPF-UI" />
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PeaceWpf.Core\PeaceWpf.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- AutoEQ 结果库（从 Peace 自带的 AutoEQCompressed5.7z 解开）跟着程序走，运行时按需读。 -->
+    <Content Include="AutoEqData\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 品牌图标（Simple Icons 的矢量路径 + 维基共享资源的字标位图），列表里那个小标就用它 -->
+    <Content Include="AutoEqData\*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="AutoEqData\brand-logos\*.png" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 无延迟防爆音用的 VST（Airwindows ClipOnly3，MIT），运行时由 PeakGuardSetup 复制到 APO 目录 -->
+    <Content Include="Assets\*.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Silero VAD 模型（2.3 MB，MIT）：自动风味判断「有没有人声」用，运行时懒加载。 -->
+    <Content Include="Assets\*.onnx" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 图标进资源集：启动画面的正中心大图 + 标题栏角落的小标 + 窗口/任务栏图标 -->
+    <Resource Include="Assets\logo.png" />
+    <Resource Include="Assets\EasyEQ.ico" />
+    <!-- 「按住曲线」的张开手 / 握住手。系统没有这两个光标，只能自带 -->
+    <Resource Include="Assets\cursor-open.cur" />
+    <Resource Include="Assets\cursor-grab.cur" />
+  </ItemGroup>
+
+</Project>

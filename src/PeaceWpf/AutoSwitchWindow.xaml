@@ -1,0 +1,439 @@
+<ui:FluentWindow x:Class="PeaceWpf.AutoSwitchWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 Title="自动切换 · 按组合切曲线"
+                 Width="1064"
+                 SizeToContent="Height"
+                 MaxHeight="760"
+                 ResizeMode="NoResize"
+                 WindowStartupLocation="CenterOwner">
+
+    <ui:FluentWindow.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+
+        <!-- 预设下拉里只显示名字，不带 .peace；选中的值仍然是完整文件名。
+             两个下拉都直接用主题的默认样式（黑色圆角），只换这一层模板。 -->
+        <DataTemplate x:Key="PresetItemTemplate">
+            <TextBlock Text="{Binding Converter={StaticResource PresetName}}" />
+        </DataTemplate>
+
+        <!-- 空状态那张卡本身就是「新建」按钮：和组合行一样大，悬停加蓝边。 -->
+        <Style x:Key="PlaceholderCard" TargetType="Button">
+            <Setter Property="Height" Value="52" />
+            <Setter Property="Margin" Value="0,0,0,8" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Foreground" Value="#FFF0F0F0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Card"
+                                Background="#FF1D1D1D"
+                                BorderBrush="#FF3F3F3F"
+                                BorderThickness="1"
+                                CornerRadius="10"
+                                Padding="10,8">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Card" Property="BorderBrush" Value="#FF4CC2FF" />
+                                <Setter TargetName="Card" Property="Background" Value="#334CC2FF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 一组 = 一行：勾选框 + 左右曲线 + 低音曲线 + 叠加开关 + 热键 + 进程绑定。
+             增益和风味跟着左右预设走，所以这里不用再让人选一遍。 -->
+        <DataTemplate x:Key="SwitchRowTemplate">
+            <!-- 外圈留出卡片之间的缝；拖动时整行自己跟着鼠标挪，不另画插入线 -->
+            <Grid Margin="0,0,0,8">
+                <Border Padding="10,8"
+                        CornerRadius="10"
+                        BorderThickness="1">
+                <!-- 右键整行 = 复制这一组：只带两条曲线和叠加开关，热键 / 进程不带。 -->
+                <Border.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="复制组合" Click="OnCopyRowClicked" />
+                    </ContextMenu>
+                </Border.ContextMenu>
+                <Border.Style>
+                    <Style TargetType="Border">
+                        <Setter Property="Background" Value="#FF1D1D1D" />
+                        <Setter Property="BorderBrush" Value="#FF3F3F3F" />
+                        <Style.Triggers>
+                            <!-- 当前正在用的那一组：蓝框 + 淡蓝底 -->
+                            <DataTrigger Binding="{Binding IsActive}" Value="True">
+                                <Setter Property="Background" Value="#334CC2FF" />
+                                <Setter Property="BorderBrush" Value="#FF4CC2FF" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Border.Style>
+
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <!-- 顺序：拖动手柄 + 序号 -->
+                        <ColumnDefinition Width="40" />
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="126" />
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="170" />
+                        <!-- 智能绑定：语音唤醒只能绑一个组合 -->
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="28" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- 顺序：按住拖动改优先级。热键 / 进程重复时，排在前面的那一组生效 -->
+                    <StackPanel Grid.Column="0"
+                                Orientation="Horizontal"
+                                VerticalAlignment="Center"
+                                Margin="0,0,6,0"
+                                Background="Transparent"
+                                Cursor="SizeNS"
+                                ToolTip="按住拖动改顺序：热键或进程重复时，排在前面的那一组生效"
+                                MouseLeftButtonDown="OnDragHandleMouseDown"
+                                MouseMove="OnDragHandleMouseMove"
+                                MouseLeftButtonUp="OnDragHandleMouseUp">
+                        <TextBlock Text="⠿"
+                                   FontSize="15"
+                                   Opacity="0.45"
+                                   VerticalAlignment="Center"
+                                   Margin="0,0,5,0" />
+                        <TextBlock Text="{Binding Order}"
+                                   FontSize="11"
+                                   Opacity="0.5"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+
+                    <!-- 勾上就用这一组；同一时间只有一组是勾上的 -->
+                    <CheckBox Grid.Column="1"
+                              Width="20"
+                              Height="20"
+                              Margin="0,0,6,0"
+                              Padding="0"
+                              VerticalAlignment="Center"
+                              IsChecked="{Binding IsActive, Mode=OneWay}"
+                              Click="OnActivateRowClicked"
+                              ToolTip="勾上就切到这一组曲线" />
+
+                    <!-- 左右曲线：还没选时盖一层「未选择」占位 -->
+                    <Grid Grid.Column="2" Margin="0,0,8,0">
+                        <ComboBox Height="34"
+                                  FontSize="12"
+                                  VerticalContentAlignment="Center"
+                                  ContextMenu="{x:Null}"
+                                  Tag="main"
+                                  PreviewMouseRightButtonDown="OnPresetRightButtonDown"
+                                  ItemTemplate="{StaticResource PresetItemTemplate}"
+                                  ItemsSource="{Binding DataContext.PresetNames, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
+                                  SelectedItem="{Binding MainPreset, Mode=TwoWay}"
+                                  ToolTip="右键直接清成未选择；清空表示激活这一组时不动左右层" />
+                        <TextBlock Text="未选择"
+                                   FontSize="12"
+                                   Opacity="0.45"
+                                   IsHitTestVisible="False"
+                                   VerticalAlignment="Center"
+                                   HorizontalAlignment="Left"
+                                   Margin="12,0,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding MainPreset}" Value="">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Grid>
+
+                    <!-- 低音曲线 -->
+                    <Grid Grid.Column="3" Margin="0,0,8,0">
+                        <ComboBox Height="34"
+                                  FontSize="12"
+                                  VerticalContentAlignment="Center"
+                                  ContextMenu="{x:Null}"
+                                  Tag="bass"
+                                  PreviewMouseRightButtonDown="OnPresetRightButtonDown"
+                                  ItemTemplate="{StaticResource PresetItemTemplate}"
+                                  ItemsSource="{Binding DataContext.PresetNames, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
+                                  SelectedItem="{Binding BassPreset, Mode=TwoWay}"
+                                  ToolTip="右键直接清成未选择；清空表示激活这一组时不动低音层" />
+                        <TextBlock Text="未选择"
+                                   FontSize="12"
+                                   Opacity="0.45"
+                                   IsHitTestVisible="False"
+                                   VerticalAlignment="Center"
+                                   HorizontalAlignment="Left"
+                                   Margin="12,0,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding BassPreset}" Value="">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Grid>
+
+                    <CheckBox Grid.Column="4"
+                              Content="叠加低音修正"
+                              FontSize="12"
+                              VerticalAlignment="Center"
+                              Padding="0"
+                              Margin="0,0,8,0"
+                              IsChecked="{Binding BassEnabled, Mode=TwoWay}"
+                              ToolTip="这一组要不要把低音层叠进左右；和顶栏那个勾选是同一件事" />
+
+                    <!-- 热键框：单击开始录键，录的时候框里出现勾和叉；绑好之后右边常驻一个叉 -->
+                    <Border Grid.Column="5"
+                            Height="34"
+                            Margin="0,0,8,0"
+                            CornerRadius="6"
+                            Cursor="Hand"
+                            MouseLeftButtonDown="OnHotkeyCellMouseDown"
+                            ToolTip="单击后按下要绑定的组合键，再点框里的勾确认">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Background" Value="#FF2A2A2A" />
+                                <Setter Property="BorderBrush" Value="#FF3F3F3F" />
+                                <Setter Property="BorderThickness" Value="1" />
+                                <Style.Triggers>
+                                    <!-- 和另一行曲线相同、热键也相同：描红 -->
+                                    <DataTrigger Binding="{Binding HasHotkeyConflict}" Value="True">
+                                        <Setter Property="BorderBrush" Value="#FFE06C6C" />
+                                        <Setter Property="BorderThickness" Value="1.5" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+
+                        <Grid>
+                            <TextBlock Text="{Binding HotkeyText}"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"
+                                       Margin="8,0,46,0"
+                                       TextTrimming="CharacterEllipsis" />
+                            <StackPanel Orientation="Horizontal"
+                                        HorizontalAlignment="Right"
+                                        VerticalAlignment="Center"
+                                        Margin="0,0,4,0"
+                                        Visibility="{Binding IsCapturing, Converter={StaticResource BoolToVis}}">
+                                <Button Content="✓"
+                                        Width="22"
+                                        Height="22"
+                                        Padding="0"
+                                        FontSize="12"
+                                        AutomationProperties.AutomationId="HotkeyCommitButton"
+                                        Click="OnHotkeyCommitClicked"
+                                        ToolTip="确认这个热键" />
+                                <Button Content="✗"
+                                        Width="22"
+                                        Height="22"
+                                        Padding="0"
+                                        FontSize="12"
+                                        Margin="4,0,0,0"
+                                        AutomationProperties.AutomationId="HotkeyCancelButton"
+                                        Click="OnHotkeyCancelClicked"
+                                        ToolTip="不绑这个热键" />
+                            </StackPanel>
+
+                            <Button Content="✕"
+                                    Width="22"
+                                    Height="22"
+                                    Padding="0"
+                                    FontSize="11"
+                                    HorizontalAlignment="Right"
+                                    VerticalAlignment="Center"
+                                    Margin="0,0,4,0"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Click="OnHotkeyClearClicked"
+                                    ToolTip="解除热键绑定"
+                                    Visibility="{Binding ShowHotkeyClear, Converter={StaticResource BoolToVis}}" />
+                        </Grid>
+                    </Border>
+
+                    <!-- 进程框：点一下进选择模式；绑上之后右边出现叉 -->
+                    <Border Grid.Column="6"
+                            Height="34"
+                            Margin="0,0,8,0"
+                            CornerRadius="6"
+                            Cursor="Hand"
+                            MouseLeftButtonDown="OnProcessCellMouseDown"
+                            ToolTip="点击后隐藏界面，选一个窗口来绑定；切到这个进程时自动套用这一组">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Background" Value="#FF2A2A2A" />
+                                <Setter Property="BorderBrush" Value="#FF3F3F3F" />
+                                <Setter Property="BorderThickness" Value="1" />
+                                <Style.Triggers>
+                                    <!-- 和另一行曲线相同、进程也相同：描红 -->
+                                    <DataTrigger Binding="{Binding HasProcessConflict}" Value="True">
+                                        <Setter Property="BorderBrush" Value="#FFE06C6C" />
+                                        <Setter Property="BorderThickness" Value="1.5" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+
+                        <Grid>
+                            <TextBlock Text="{Binding ProcessText}"
+                                       FontSize="12"
+                                       VerticalAlignment="Center"
+                                       Margin="8,0"
+                                       TextTrimming="CharacterEllipsis" />
+                            <Button Content="✕"
+                                    Width="22"
+                                    Height="22"
+                                    Padding="0"
+                                    FontSize="11"
+                                    HorizontalAlignment="Right"
+                                    VerticalAlignment="Center"
+                                    Margin="0,0,4,0"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Click="OnProcessClearClicked"
+                                    ToolTip="解除进程绑定"
+                                    Visibility="{Binding HasProcess, Converter={StaticResource BoolToVis}}" />
+                        </Grid>
+                    </Border>
+
+                    <!-- 智能绑定：语音唤醒。全局只能有一个组合，同组合的多行一起亮 -->
+                    <CheckBox Grid.Column="7"
+                              Content="语音唤醒"
+                              FontSize="12"
+                              VerticalAlignment="Center"
+                              Padding="0"
+                              Margin="0,0,8,0"
+                              IsChecked="{Binding IsVoiceWake, Mode=OneWay}"
+                              Click="OnVoiceWakeClicked"
+                              ToolTip="检测到人声时套用这一组；全局只能绑一个组合，左右/低音/叠加都一样的多行算同一个" />
+
+                    <Button Grid.Column="9"
+                            Content="✕"
+                            Width="24"
+                            Height="24"
+                            Padding="0"
+                            FontSize="11"
+                            VerticalAlignment="Center"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Click="OnDeleteRowClicked"
+                            ToolTip="删除这一组（立即保存，不能撤回）" />
+                </Grid>
+                </Border>
+            </Grid>
+        </DataTemplate>
+    </ui:FluentWindow.Resources>
+
+    <StackPanel Margin="24,18,24,20">
+        <Grid>
+            <StackPanel>
+                <TextBlock Text="自动切换"
+                           FontSize="20"
+                           FontWeight="SemiBold" />
+                <TextBlock Text="每一行是一套完整的声音：左右曲线、低音曲线、低音叠不叠加。增益和风味跟着左右预设走，不用再选。勾上某一行、按下热键、切到绑定的进程，或者开了语音唤醒听到人声，就套用那一行。"
+                           FontSize="12"
+                           Opacity="0.7"
+                           TextWrapping="Wrap"
+                           Margin="0,6,0,16" />
+            </StackPanel>
+
+            <Button Content="✕"
+                    Width="30"
+                    Height="30"
+                    Padding="0"
+                    FontSize="13"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Top"
+                    AutomationProperties.AutomationId="AutoSwitchCloseButton"
+                    Click="OnCloseClicked"
+                    ToolTip="关闭" />
+        </Grid>
+
+        <!-- 表头：列宽和下面的行模板一一对应 -->
+        <Grid Margin="12,0,12,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="40" />
+                <ColumnDefinition Width="28" />
+                <ColumnDefinition Width="150" />
+                <ColumnDefinition Width="150" />
+                <ColumnDefinition Width="126" />
+                <ColumnDefinition Width="150" />
+                <ColumnDefinition Width="170" />
+                <ColumnDefinition Width="150" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="28" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="顺序" FontSize="11" Opacity="0.55" Margin="0,0,6,0" />
+            <TextBlock Grid.Column="1" Text="切换" FontSize="11" Opacity="0.55" Margin="0,0,6,0" />
+            <TextBlock Grid.Column="2" Text="左右曲线" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+            <TextBlock Grid.Column="3" Text="低音曲线" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+            <TextBlock Grid.Column="4" Text="叠加低音修正" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+            <TextBlock Grid.Column="5" Text="热键" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+            <TextBlock Grid.Column="6" Text="进程绑定" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+            <TextBlock Grid.Column="7" Text="智能绑定" FontSize="11" Opacity="0.55" Margin="0,0,8,0" />
+        </Grid>
+
+        <ScrollViewer MaxHeight="360"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <ItemsControl x:Name="RowsList"
+                          AllowDrop="True"
+                          ItemTemplate="{StaticResource SwitchRowTemplate}"
+                          DragOver="OnRowsDragOver"
+                          Drop="OnRowsDrop"
+                          AutomationProperties.AutomationId="AutoSwitchRows" />
+        </ScrollViewer>
+
+        <!-- 没有组合时：这张卡本身就是新建按钮 -->
+        <Button x:Name="EmptyHint"
+                Style="{StaticResource PlaceholderCard}"
+                Visibility="Collapsed"
+                AutomationProperties.AutomationId="AutoSwitchEmptyButton"
+                Click="OnAddRowClicked"
+                ToolTip="新建一组：先选左右和低音曲线">
+            <TextBlock Text="当前没有组合 + 点击新建组合"
+                       FontSize="12"
+                       Opacity="0.55"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
+        </Button>
+
+        <!-- 有组合时：新建按钮和组合行一样大、间距一样 -->
+        <Button x:Name="AddButton"
+                Style="{StaticResource PlaceholderCard}"
+                Visibility="Collapsed"
+                AutomationProperties.AutomationId="AutoSwitchAddButton"
+                Click="OnAddRowClicked"
+                ToolTip="新建一组：先选左右和低音曲线">
+            <TextBlock Text="+ 新建组合"
+                       FontSize="12"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
+        </Button>
+
+        <TextBlock x:Name="ErrorText"
+                   FontSize="11"
+                   Foreground="#FFE06C6C"
+                   TextWrapping="Wrap"
+                   MaxWidth="760"
+                   Margin="4,8,0,0"
+                   Visibility="Collapsed" />
+    </StackPanel>
+</ui:FluentWindow>

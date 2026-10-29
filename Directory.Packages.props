@@ -1,0 +1,14 @@
+<Project>
+  <!-- 中央包版本管理：所有项目只写 <PackageReference Include="..." />，版本在这里改。 -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="WPF-UI" Version="4.3.0" />
+    <PackageVersion Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <!-- WASAPI loopback：抓系统输出做实时频谱（S5）。只引 Wasapi，NAudio.Core 会被它带进来。 -->
+    <PackageVersion Include="NAudio.Wasapi" Version="2.2.1" />
+    <!-- 人声检测：跑 Silero VAD 的 ONNX 模型。只用 CPU 版，不碰 GPU/DirectML。 -->
+    <PackageVersion Include="Microsoft.ML.OnnxRuntime" Version="1.31.1" />
+  </ItemGroup>
+</Project>
